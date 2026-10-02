@@ -37,7 +37,10 @@ def main():
     component = args.component
     output = root / 'evidence'
     output.mkdir(exist_ok=False)
-    parent = 'node:22-trixie-slim' if component == 'whatsapp' else 'python:3.12-slim-trixie'
+    # Worker uses one supported distribution throughout: no Ubuntu binaries in
+    # Debian, and no interpreter or shared objects copied across distributions.
+    parent = ('node:22-trixie-slim' if component == 'whatsapp' else
+              'ubuntu:24.04' if component == 'worker' else 'python:3.12-slim-trixie')
     run('docker', 'pull', '--platform', 'linux/amd64', parent)
     inspected = json.loads(run('docker', 'image', 'inspect', parent, capture=True))[0]
     index_ref = inspected['RepoDigests'][0]
@@ -60,6 +63,10 @@ def main():
     (output / 'parent-inspect.json').write_text(json.dumps(inspected, indent=2) + '\n')
     (output / 'parent-index.json').write_text(json.dumps(index, indent=2) + '\n')
     lines = ['FROM ' + parent_ref + ' AS deps-build', 'WORKDIR /app']
+    if component == 'worker':
+        lines += ['RUN apt-get update && apt-get install -y --no-install-recommends python3.12-venv ca-certificates && rm -rf /var/lib/apt/lists/*',
+                  'RUN python3.12 -m venv /opt/tm-python',
+                  'ENV PATH=/opt/tm-python/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin']
     if component == 'whatsapp':
         lines += ['RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates git python3 make g++ && rm -rf /var/lib/apt/lists/*',
                   'COPY whatsapp/package.json whatsapp/package-lock.json /app/whatsapp/',
@@ -85,11 +92,15 @@ def main():
                   'COPY whatsapp/package.json whatsapp/package-lock.json /app/whatsapp/',
                   'RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack /opt/yarn-v* && rm -f /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/yarn /usr/local/bin/yarnpkg /usr/local/bin/corepack']
     else:
-        lines += ['COPY --from=deps-build /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages',
-                  'COPY --from=deps-build /usr/local/bin /usr/local/bin']
         if component == 'worker':
-            lines += ['RUN apt-get update && apt-get -o Dir::Cache::archives=/dependency-debs/ -o APT::Keep-Downloaded-Packages=true install -y --no-install-recommends tesseract-ocr tesseract-ocr-rus tesseract-ocr-eng libgomp1 ca-certificates tor && rm -rf /var/lib/apt/lists/*',
+            lines += ['RUN apt-get update && apt-get -o Dir::Cache::archives=/dependency-debs/ -o APT::Keep-Downloaded-Packages=true install -y --no-install-recommends python3.12 tesseract-ocr tesseract-ocr-rus tesseract-ocr-eng libgomp1 ca-certificates tor fonts-dejavu-core && dpkg --compare-versions "$(dpkg-query -W -f=\'${Version}\' libxml2)" ge 2.9.14+dfsg-1.3ubuntu3.9 && rm -rf /var/lib/apt/lists/*',
+                      'COPY --from=deps-build /opt/tm-python /opt/tm-python',
+                      'RUN /opt/tm-python/bin/python -m pip uninstall -y pip && ln -s /opt/tm-python/bin/python /usr/local/bin/python',
+                      'ENV PATH=/opt/tm-python/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
                       'ENV TM_SERVER_WORKER=1 TM_WORKER_STATE_DIR=/state TM_TELEGRAM_SESSION=/state/telegram_helper.session TM_MODELS_HOME=/models-root TM_MODELS_DIR=/models TM_AUDIO_PYTHON=/usr/local/bin/python TM_MEDIA_BACKEND=linux TM_OCR_LANG=rus+eng']
+        else:
+            lines += ['COPY --from=deps-build /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages',
+                      'COPY --from=deps-build /usr/local/bin /usr/local/bin']
     lines += ['USER 10001:10001', 'ENTRYPOINT []', 'CMD ["/bin/false"]']
     recipe = '\n'.join(lines) + '\n'
     (root / 'Dependency.Dockerfile').write_text(recipe)
@@ -100,6 +111,33 @@ def main():
     run('docker', 'build', '--platform', 'linux/amd64', '-f', str(root / 'Dependency.Dockerfile'), '-t', tag, str(root))
     image = json.loads(run('docker', 'image', 'inspect', tag, capture=True))[0]
     (output / 'candidate-inspect.json').write_text(json.dumps(image, indent=2) + '\n')
+    # Actual files and resolved package-documentation links, not SPDX guesses.
+    notice_cmd = '''import pathlib,json,hashlib,subprocess
+packages=subprocess.check_output(['dpkg-query','-W','-f=${binary:Package}\\t${Version}\\n'],text=True).splitlines()
+records=[]
+for row in packages:
+ package,version=row.split('\\t');path=pathlib.Path('/usr/share/doc')/package.split(':')[0]/'copyright'
+ item={'package':package,'version':version,'requested_path':str(path)}
+ if path.exists():
+  resolved=path.resolve(strict=True)
+  if not resolved.is_relative_to('/usr/share/doc'): raise SystemExit('copyright path escaped documentation root')
+  content=resolved.read_bytes()
+  if len(content)>1048576: raise SystemExit('notice exceeds bound')
+  item.update(resolved_path=str(resolved),sha256=hashlib.sha256(content).hexdigest(),text=content.decode('utf-8',errors='replace'))
+ else: item['missing']=True
+ records.append(item)
+links=[]
+root=pathlib.Path('/app')
+for path in root.rglob('*'):
+ if path.is_symlink():
+  resolved=path.resolve(strict=True)
+  if not resolved.is_relative_to(root) or not resolved.is_file(): raise SystemExit('application dependency link escapes or dangles')
+  links.append({'path':str(path),'target':str(path.readlink()),'resolved':str(resolved),'sha256':hashlib.sha256(resolved.read_bytes()).hexdigest()})
+print(json.dumps({'package_notices':records,'app_links':links,'independently_accepted':False}))'''
+    if component != 'whatsapp':
+        (output / 'actual-package-notices-and-links.json').write_text(run(
+            'docker', 'run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL',
+            '--security-opt', 'no-new-privileges', '--entrypoint', 'python', tag, '-c', notice_cmd, capture=True) + '\n')
     if component == 'whatsapp':
         smoke = "const D=require('/app/whatsapp/node_modules/better-sqlite3');const d=new D(':memory:');d.exec('create table replay(id text primary key)');d.prepare('insert or ignore into replay values (?)').run('synthetic');d.prepare('insert or ignore into replay values (?)').run('synthetic');if(d.prepare('select count(*) n from replay').get().n!==1)throw Error('sqlite dedupe');d.close();import('/app/whatsapp/node_modules/@whiskeysockets/baileys/lib/index.js').then(()=>console.log(JSON.stringify({sqlite_native_abi:true,baileys_import:true,application_started:false})))"
         (output / 'dependency-smoke.json').write_text(run('docker', 'run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--entrypoint', 'node', tag, '-e', smoke, capture=True) + '\n')
@@ -108,12 +146,37 @@ def main():
                    'calendar': 'import radicale,gunicorn,psycopg,argon2,icalendar',
                    'worker': 'import telethon,postgrest,av,numpy,faster_whisper,pymupdf,pytesseract;from PIL import Image;import io;image=Image.new("RGB",(16,16),(255,255,255));buffer=io.BytesIO();image.save(buffer,format="PNG");buffer.seek(0);decoded=Image.open(buffer);decoded.load();assert decoded.size==(16,16)'}[component]
         (output / 'dependency-smoke.json').write_text(run('docker', 'run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--entrypoint', 'python', tag, '-c', imports + ';import json;print(json.dumps({"imports_verified":True,"application_started":False}))', capture=True) + '\n')
+        if component == 'worker':
+            # Actual native OCR, PDF, codec and XML ABI checks, with synthetic
+            # payloads only. No Telegram session, model download or application.
+            native_smoke = '''import io,json,ctypes,ctypes.util,wave,av,pymupdf,pytesseract
+from PIL import Image,ImageDraw,ImageFont
+image=Image.new('RGB',(650,100),'white');draw=ImageDraw.Draw(image)
+draw.text((15,15),'SYNTHETIC 123',font=ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',36),fill='black')
+text=pytesseract.image_to_string(image,config='--psm 7',lang='eng').strip()
+assert 'SYNTHETIC' in text and '123' in text,text
+assert {'eng','rus'}<=set(pytesseract.get_languages(config=''))
+doc=pymupdf.open();page=doc.new_page();page.insert_text((30,40),'SYNTHETIC 123');pdf=doc.tobytes();doc.close()
+with pymupdf.open(stream=pdf,filetype='pdf') as doc:
+ pix=doc[0].get_pixmap();assert pix.width>0 and pix.height>0
+audio=io.BytesIO()
+with wave.open(audio,'wb') as wav:
+ wav.setnchannels(1);wav.setsampwidth(2);wav.setframerate(16000);wav.writeframes(b'\\0'*32000)
+audio.seek(0)
+with av.open(audio,format='wav') as container: assert sum(f.samples for f in container.decode(audio=0))==16000
+xml=ctypes.CDLL(ctypes.util.find_library('xml2'));xml.xmlReadMemory.argtypes=[ctypes.c_char_p,ctypes.c_int,ctypes.c_char_p,ctypes.c_char_p,ctypes.c_int];xml.xmlReadMemory.restype=ctypes.c_void_p;xml.xmlFreeDoc.argtypes=[ctypes.c_void_p]
+payload=b'<synthetic><value>123</value></synthetic>';ptr=xml.xmlReadMemory(payload,len(payload),None,None,2048);assert ptr;xml.xmlFreeDoc(ptr)
+print(json.dumps({'ocr_text':text,'russian_english_models_present':True,'pdf_native_render':True,'wav_native_decode':True,'xml_abi_smoke':True,'security_regression_poc':False,'application_started':False}))'''
+            (output / 'worker-native-smoke.json').write_text(run(
+                'docker', 'run', '--rm', '--network', 'none', '--read-only', '--tmpfs', '/tmp:rw,noexec,nosuid,size=16m',
+                '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--entrypoint', 'python', tag, '-c', native_smoke, capture=True) + '\n')
     (output / 'apt-inventory.txt').write_text(run('docker', 'run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--entrypoint', 'dpkg-query', tag, '-W', '-f=${Package}\t${Version}\t${Architecture}\n', capture=True) + '\n')
     deb_cmd = "import pathlib,hashlib,json;print(json.dumps({p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in pathlib.Path('/dependency-debs').glob('*.deb')}))"
     if component == 'worker':
         (output / 'deb-hashes.json').write_text(run('docker', 'run', '--rm', '--network', 'none', '--read-only', '--entrypoint', 'python', tag, '-c', deb_cmd, capture=True) + '\n')
     if component != 'whatsapp':
-        (output / 'python-freeze.txt').write_text(run('docker', 'run', '--rm', '--network', 'none', '--read-only', '--entrypoint', 'python', tag, '-m', 'pip', 'freeze', '--all', capture=True) + '\n')
+        freeze_cmd = "import importlib.metadata as m;print('\\n'.join(sorted(d.metadata['Name']+'=='+d.version for d in m.distributions())))"
+        (output / 'python-freeze.txt').write_text(run('docker', 'run', '--rm', '--network', 'none', '--read-only', '--entrypoint', 'python', tag, '-c', freeze_cmd, capture=True) + '\n')
         inventory = "import importlib.metadata as m,json;print(json.dumps([{'name':d.metadata['Name'],'version':d.version,'license':d.metadata.get('License'),'license_expression':d.metadata.get('License-Expression')} for d in m.distributions()],sort_keys=True))"
         (output / 'python-licenses.json').write_text(run('docker', 'run', '--rm', '--network', 'none', '--read-only', '--entrypoint', 'python', tag, '-c', inventory, capture=True) + '\n')
         wheel_cmd = "import pathlib,hashlib,json;print(json.dumps({p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in pathlib.Path('/dependency-wheels').glob('*')}))"
@@ -123,6 +186,26 @@ def main():
         lock_cmd = "import pathlib,zipfile,email.parser,hashlib;items=[];\nfor p in pathlib.Path('/dependency-wheels').glob('*.whl'):\n z=zipfile.ZipFile(p);names=[n for n in z.namelist() if n.endswith('.dist-info/METADATA')];assert len(names)==1;m=email.parser.BytesParser().parsebytes(z.read(names[0]));items.append(m['Name']+'=='+m['Version']+' --hash=sha256:'+hashlib.sha256(p.read_bytes()).hexdigest())\nprint('\\n'.join(sorted(items)))"
         (output / 'resolved-requirements.lock').write_text(run('docker', 'run', '--rm', '--network', 'none', '--read-only', '--entrypoint', 'python', builder, '-c', lock_cmd, capture=True) + '\n')
     else:
+        notice_js = '''const fs=require('fs'),p=require('path'),cp=require('child_process'),crypto=require('crypto');
+const hash=b=>crypto.createHash('sha256').update(b).digest('hex');
+const within=(r,t)=>t===r||t.startsWith(r+'/');
+let records=[],links=[],npm=[];
+for(const row of cp.execFileSync('dpkg-query',['-W','-f=${binary:Package}\\t${Version}\\n'],{encoding:'utf8'}).trim().split('\\n')){
+ const [name,version]=row.split('\\t'),path='/usr/share/doc/'+name.split(':')[0]+'/copyright';
+ const item={package:name,version,requested_path:path};
+ if(fs.existsSync(path)){const resolved=fs.realpathSync(path);if(!within('/usr/share/doc',resolved))throw Error('notice path escaped');const b=fs.readFileSync(resolved);if(b.length>1048576)throw Error('notice bound');Object.assign(item,{resolved_path:resolved,sha256:hash(b),text:b.toString('utf8')});}else item.missing=true;
+ records.push(item);
+}
+function walk(root){for(const x of fs.readdirSync(root,{withFileTypes:true})){
+ const path=p.join(root,x.name);
+ if(x.isSymbolicLink()){const resolved=fs.realpathSync(path);if(!within('/app',resolved)||!fs.statSync(resolved).isFile())throw Error('app link escaped or dangling');links.push({path,target:fs.readlinkSync(path),resolved,sha256:hash(fs.readFileSync(resolved))});}
+ else if(x.isDirectory())walk(path);
+ else if(x.isFile()&&/^(license|license.txt|license.md|copying)$/i.test(x.name)){const b=fs.readFileSync(path);if(b.length>1048576)throw Error('notice bound');npm.push({path,sha256:hash(b),text:b.toString('utf8')});}
+}}walk('/app');
+console.log(JSON.stringify({package_notices:records,npm_notice_files:npm,app_links:links,independently_accepted:false}));'''
+        (output / 'actual-package-notices-and-links.json').write_text(run(
+            'docker', 'run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL',
+            '--security-opt', 'no-new-privileges', '--entrypoint', 'node', tag, '-e', notice_js, capture=True) + '\n')
         node_cmd = "const fs=require('fs'),path=require('path');let a=[];function walk(p){for(const x of fs.readdirSync(p,{withFileTypes:true})){if(x.isDirectory()&&!x.isSymbolicLink())walk(path.join(p,x.name));else if(x.name==='package.json'){try{let j=JSON.parse(fs.readFileSync(path.join(p,x.name)));a.push({path:path.relative('/app/whatsapp',p),name:j.name,version:j.version,license:j.license||null})}catch(e){throw e}}}}walk('/app/whatsapp/node_modules');console.log(JSON.stringify(a))"
         (output / 'npm-licenses.json').write_text(run('docker', 'run', '--rm', '--network', 'none', '--read-only', '--entrypoint', 'node', tag, '-e', node_cmd, capture=True) + '\n')
     archive = output / 'candidate-image.tar'
