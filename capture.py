@@ -37,10 +37,9 @@ def main():
     component = args.component
     output = root / 'evidence'
     output.mkdir(exist_ok=False)
-    # Worker uses one supported distribution throughout: no Ubuntu binaries in
+    # All components use one supported distribution throughout: no Ubuntu binaries in
     # Debian, and no interpreter or shared objects copied across distributions.
-    parent = ('node:22-trixie-slim' if component == 'whatsapp' else
-              'ubuntu:24.04' if component == 'worker' else 'python:3.12-slim-trixie')
+    parent = 'ubuntu:24.04'
     run('docker', 'pull', '--platform', 'linux/amd64', parent)
     inspected = json.loads(run('docker', 'image', 'inspect', parent, capture=True))[0]
     index_ref = inspected['RepoDigests'][0]
@@ -63,10 +62,11 @@ def main():
     (output / 'parent-inspect.json').write_text(json.dumps(inspected, indent=2) + '\n')
     (output / 'parent-index.json').write_text(json.dumps(index, indent=2) + '\n')
     lines = ['FROM ' + parent_ref + ' AS deps-build', 'WORKDIR /app']
-    if component == 'worker':
+    if component != 'whatsapp':
         lines += ['RUN apt-get update && apt-get install -y --no-install-recommends python3.12-venv ca-certificates && rm -rf /var/lib/apt/lists/*',
                   'RUN python3.12 -m venv /opt/tm-python',
                   'ENV PATH=/opt/tm-python/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin']
+    if component == 'worker':
         native_source = 'db20f322d03664d1e878e2fbf6e904f5da755594'
         gtest_source = '7d76a231b0e29caf86e68d1df858308cd53b2a66'
         native_tests = ['normproto_test', 'fullyconnected_test', 'genericvector_test',
@@ -74,8 +74,8 @@ def main():
                         'recoder_test', 'lstm_layer_test']
         targets = ' '.join(native_tests)
         test_pattern = '^(' + '|'.join(native_tests) + ')$'
-        common = '-DBUILD_SHARED_LIBS=ON -DBUILD_TESTS=ON -DBUILD_TRAINING_TOOLS=ON -DDISABLE_ARCHIVE=ON -DDISABLE_CURL=ON -DGRAPHICS_DISABLED=ON -DENABLE_NATIVE=OFF -DCMAKE_INSTALL_LIBDIR=lib'
-        lines += ['RUN apt-get update && apt-get install -y --no-install-recommends git build-essential cmake pkg-config libleptonica-dev libicu-dev && rm -rf /var/lib/apt/lists/*',
+        common = '-DBUILD_SHARED_LIBS=ON -DBUILD_TESTS=ON -DBUILD_TRAINING_TOOLS=OFF -DDISABLE_ARCHIVE=ON -DDISABLE_CURL=ON -DGRAPHICS_DISABLED=ON -DENABLE_NATIVE=OFF -DCMAKE_INSTALL_LIBDIR=lib'
+        lines += ['RUN apt-get update && apt-get install -y --no-install-recommends git build-essential cmake pkg-config libleptonica-dev libtiff-dev libicu-dev && rm -rf /var/lib/apt/lists/*',
                   'RUN git init /tesseract-source && git -C /tesseract-source remote add origin https://github.com/tesseract-ocr/tesseract.git && git -C /tesseract-source fetch --depth=1 origin ' + native_source + ' && git -C /tesseract-source checkout --detach FETCH_HEAD && test "$(git -C /tesseract-source rev-parse HEAD)" = ' + native_source,
                   'RUN git init /tesseract-source/unittest/third_party/googletest && git -C /tesseract-source/unittest/third_party/googletest remote add origin https://github.com/google/googletest.git && git -C /tesseract-source/unittest/third_party/googletest fetch --depth=1 origin ' + gtest_source + ' && git -C /tesseract-source/unittest/third_party/googletest checkout --detach FETCH_HEAD && test "$(git -C /tesseract-source/unittest/third_party/googletest rev-parse HEAD)" = ' + gtest_source,
                   'RUN cmake -S /tesseract-source -B /tesseract-release -DCMAKE_BUILD_TYPE=Release ' + common + ' && cmake --build /tesseract-release --parallel 2 --target tesseract ' + targets,
@@ -84,7 +84,13 @@ def main():
                   'RUN cd /tesseract-sanitized && ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 ctest --no-tests=error --output-on-failure --output-junit /native-sanitized-tests.xml -R "' + test_pattern + '"',
                   'RUN mkdir -p /tesseract-runtime/bin /tesseract-runtime/lib /tesseract-runtime/licenses && cp /tesseract-release/bin/tesseract /tesseract-runtime/bin/ && cp -a /tesseract-release/libtesseract.so* /tesseract-runtime/lib/ && cp /tesseract-source/LICENSE /tesseract-runtime/licenses/LICENSE && git -C /tesseract-source archive HEAD > /native-source.tar && git -C /tesseract-source/unittest/third_party/googletest archive HEAD > /native-test-source.tar']
     if component == 'whatsapp':
-        lines += ['RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates git python3 make g++ && rm -rf /var/lib/apt/lists/*',
+        node_hash = 'df450af89261115ef9f9e3830c3eeb2cc9213b63c720b1af623cb5dcbe2e02de'
+        node_release_fingerprint = '5BE8A3F6C8A5C01D106C0AD820B1A390B168D356'
+        lines += ['RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates git python3 make g++ curl xz-utils gnupg && rm -rf /var/lib/apt/lists/*',
+                  'RUN mkdir /node-keyring /node-upstream && chmod 700 /node-keyring && curl --fail --show-error --max-time 60 --max-filesize 65536 -o /node-release-key.asc https://raw.githubusercontent.com/nodejs/release-keys/481637f813e912c4aa3622d7964ab426c97b8e8d/keys/' + node_release_fingerprint + '.asc && echo "5115095e2f8010c75da052ecb1cfb3af630e084f0f8daa93a863557b01b0f90a  /node-release-key.asc" | sha256sum -c - && gpg --batch --homedir /node-keyring --import /node-release-key.asc',
+                  'RUN curl --fail --show-error --max-time 60 --max-filesize 65536 -o /node-SHASUMS256.txt.asc https://nodejs.org/dist/v22.23.3/SHASUMS256.txt.asc && gpg --batch --homedir /node-keyring --status-fd 1 --output /node-SHASUMS256.txt --decrypt /node-SHASUMS256.txt.asc > /node-signature-status.txt && grep -F "[GNUPG:] VALIDSIG ' + node_release_fingerprint + ' " /node-signature-status.txt && grep -Fx "' + node_hash + '  node-v22.23.3-linux-x64.tar.xz" /node-SHASUMS256.txt',
+                  'RUN curl --fail --show-error --max-time 120 --max-filesize 67108864 -o /node-upstream.tar.xz https://nodejs.org/dist/v22.23.3/node-v22.23.3-linux-x64.tar.xz && echo "' + node_hash + '  /node-upstream.tar.xz" | sha256sum -c - && tar -xJf /node-upstream.tar.xz --strip-components=1 --no-same-owner -C /node-upstream',
+                  'ENV PATH=/node-upstream/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
                   'COPY whatsapp/package.json whatsapp/package-lock.json /app/whatsapp/',
                   'COPY whatsapp/patches /app/whatsapp/patches',
                   'WORKDIR /app/whatsapp',
@@ -103,7 +109,9 @@ def main():
               'WORKDIR /app']
     if component == 'whatsapp':
         lines += ['ENV NODE_ENV=production',
-                  'RUN apt-get update && apt-get -o Dir::Cache::archives=/dependency-debs/ -o APT::Keep-Downloaded-Packages=true install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*',
+                  'RUN apt-get update && apt-get -o Dir::Cache::archives=/dependency-debs/ -o APT::Keep-Downloaded-Packages=true install -y --no-install-recommends ca-certificates libstdc++6 && rm -rf /var/lib/apt/lists/*',
+                  'COPY --from=deps-build /node-upstream/bin/node /usr/local/bin/node',
+                  'COPY --from=deps-build /node-upstream/LICENSE /usr/local/share/licenses/node/LICENSE',
                   'COPY --from=deps-build /app/whatsapp/node_modules /app/whatsapp/node_modules',
                   'COPY whatsapp/package.json whatsapp/package-lock.json /app/whatsapp/',
                   'RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack /opt/yarn-v* && rm -f /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/yarn /usr/local/bin/yarnpkg /usr/local/bin/corepack']
@@ -120,8 +128,10 @@ def main():
                       'ENV TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata',
                       'ENV TM_SERVER_WORKER=1 TM_WORKER_STATE_DIR=/state TM_TELEGRAM_SESSION=/state/telegram_helper.session TM_MODELS_HOME=/models-root TM_MODELS_DIR=/models TM_AUDIO_PYTHON=/usr/local/bin/python TM_MEDIA_BACKEND=linux TM_OCR_LANG=rus+eng']
         else:
-            lines += ['COPY --from=deps-build /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages',
-                      'COPY --from=deps-build /usr/local/bin /usr/local/bin']
+            lines += ['RUN apt-get update && apt-get -o Dir::Cache::archives=/dependency-debs/ -o APT::Keep-Downloaded-Packages=true install -y --no-install-recommends python3.12 libstdc++6 ca-certificates && rm -rf /var/lib/apt/lists/*',
+                      'COPY --from=deps-build /opt/tm-python /opt/tm-python',
+                      'RUN /opt/tm-python/bin/python -m pip uninstall -y pip && ln -s /opt/tm-python/bin/python /usr/local/bin/python',
+                      'ENV PATH=/opt/tm-python/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin']
     lines += ['USER 10001:10001', 'ENTRYPOINT []', 'CMD ["/bin/false"]']
     recipe = '\n'.join(lines) + '\n'
     (root / 'Dependency.Dockerfile').write_text(recipe)
@@ -130,6 +140,12 @@ def main():
     builder = 'tm-dependency-builder:' + component
     run('docker', 'build', '--platform', 'linux/amd64', '--target', 'deps-build', '-f', str(root / 'Dependency.Dockerfile'), '-t', builder, str(root))
     run('docker', 'build', '--platform', 'linux/amd64', '-f', str(root / 'Dependency.Dockerfile'), '-t', tag, str(root))
+    if component == 'whatsapp':
+        node_evidence = "const fs=require('fs'),crypto=require('crypto');const h=p=>crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex');console.log(JSON.stringify({version:process.version,archive_sha256:h('/node-upstream.tar.xz'),runtime_binary_sha256:h('/node-upstream/bin/node'),public_key_sha256:h('/node-release-key.asc'),signature_status:fs.readFileSync('/node-signature-status.txt','utf8'),signed_manifest:fs.readFileSync('/node-SHASUMS256.txt.asc','utf8'),upstream_license_sha256:h('/node-upstream/LICENSE'),upstream_license_text:fs.readFileSync('/node-upstream/LICENSE','utf8'),original_application_started:false,independently_accepted:false}));"
+        data = json.loads(run('docker', 'run', '--rm', '--network', 'none', '--read-only', '--entrypoint', '/node-upstream/bin/node', builder, '-e', node_evidence, capture=True))
+        if data['version'] != 'v22.23.3' or data['archive_sha256'] != node_hash:
+            raise SystemExit('Node upstream identity mismatch')
+        (output / 'node-upstream-evidence.json').write_text(json.dumps(data, indent=2) + '\n')
     if component == 'worker':
         native_evidence = '''import pathlib,json,hashlib,subprocess,xml.etree.ElementTree as ET
 def h(path): return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
