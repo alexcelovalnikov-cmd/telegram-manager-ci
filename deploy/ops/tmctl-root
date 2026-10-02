@@ -830,6 +830,29 @@ PYLEGACY
   echo "SERVER_ADMIN_SUDO_CLEANUP_OK removed=${#legacy_files[@]}"
 }
 
+backup_export() {
+  # Fixed project backup only: no caller-selected path and no secret logging.
+  python3 - <<'PY'
+import os, stat, sys
+try:
+    fd = os.open('/opt/telegram-manager/backups/latest.tar.gz', os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, 'rb') as source:
+        info = os.fstat(source.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o077:
+            raise ValueError('unsafe backup')
+        if not 0 < info.st_size <= 512 * 1024 * 1024:
+            raise ValueError('backup size outside limit')
+        while True:
+            chunk = source.read(1024 * 1024)
+            if not chunk:
+                break
+            sys.stdout.buffer.write(chunk)
+except Exception:
+    print('ERROR: project backup export failed', file=sys.stderr)
+    raise SystemExit(1) from None
+PY
+}
+
 case "${1:-}" in
   status)
     docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}' |
@@ -858,6 +881,11 @@ case "${1:-}" in
 
   backup-check)
     backup_check
+    ;;
+
+  backup-export)
+    [[ "$#" -eq 1 ]] || { echo "ERROR: backup-export accepts no arguments" >&2; exit 2; }
+    backup_export
     ;;
 
   google-credentials-import)
@@ -1082,6 +1110,7 @@ Allowed commands:
   tmctl post
   tmctl backup
   tmctl backup-check
+  tmctl backup-export                 # binary archive on stdout; save privately
   tmctl google-credentials-import # staged JSON at /opt/telegram-manager/staging/google-sheets-service-account.json
   tmctl backup-timer
   tmctl v31-runtime-finalize
