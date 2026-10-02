@@ -1,7 +1,9 @@
 """Real PostgreSQL + real Radicale; never run against production or fake dependencies.
 
-Restore the verified V22 schema into a NEW tm_v24_test database and apply 001/002
-before running. Each test uses unique synthetic identities; history is not deleted.
+Use a NEW tm_v24_test database with the real V24 schema and Calendar component
+columns. Hosted bootstrap uses only empty synthetic prerequisite tables; it does
+not claim full V22/business-schema compatibility. Each test uses unique synthetic
+identities; history is not deleted.
 """
 import os,uuid,json
 import pytest
@@ -55,6 +57,92 @@ def test_exact_retry_and_cas(setup):
     with admin.transaction() as tx:
         repo.lock(tx);tx.execute('UPDATE tm_calendar.events SET revision=revision+1 WHERE id=%s::uuid',(event['id'],))
     with pytest.raises(Rejected,match='revision'):e.apply(update['request_key'],update['preview_id'],update['preview_digest'],True,'test-user-confirmation')
+
+def pending_event(engine, calendar):
+    key='security-preview-'+uuid.uuid4().hex
+    p=engine.preview(key,[{'operation':'create_calendar_event','calendar_id':calendar,
+        'dedupe_key':key,'changes':EVENT,'evidence':USER}])
+    return key,p
+
+def assert_preview_has_no_effects(admin, calendar, key, preview):
+    with admin.transaction(read_only=True) as tx:
+        assert tx.one('SELECT count(*) AS n FROM tm_calendar.events WHERE calendar_id=%s::uuid',(calendar,))['n']==0
+        assert tx.one('SELECT count(*) AS n FROM tm_v24.operations WHERE operation=%s AND request_key=%s',('apply',key))['n']==0
+        assert tx.one('SELECT status FROM tm_v24.previews WHERE id=%s::uuid',(preview['preview_id'],))['status']=='preview'
+
+def test_wrong_preview_digest_rolls_back_without_receipt_or_event(setup):
+    admin,e,owner,viewer,pw,c=setup;key,p=pending_event(e,c)
+    wrong=('a' if p['preview_digest'][0]!='a' else 'b')+p['preview_digest'][1:]
+    with pytest.raises(Rejected,match='preview_digest_mismatch'):
+        e.apply(key,p['preview_id'],wrong,True,'test-user-confirmation')
+    assert_preview_has_no_effects(admin,c,key,p)
+    assert e.apply(key,p['preview_id'],p['preview_digest'],True,'test-user-confirmation')['applied']
+
+def test_expired_preview_has_no_receipt_or_event(setup):
+    admin,e,owner,viewer,pw,c=setup;key,p=pending_event(e,c)
+    with admin.transaction() as tx:
+        tx.execute("UPDATE tm_v24.previews SET expires_at=now()-interval '1 second' WHERE id=%s::uuid",(p['preview_id'],))
+    with pytest.raises(Rejected,match='preview_expired'):
+        e.apply(key,p['preview_id'],p['preview_digest'],True,'test-user-confirmation')
+    assert_preview_has_no_effects(admin,c,key,p)
+
+def test_concurrent_exact_preview_replay_commits_once(setup):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    admin,e,owner,viewer,pw,c=setup;key,p=pending_event(e,c)
+    barrier=Barrier(2)
+    def apply():
+        barrier.wait(timeout=5)
+        return e.apply(key,p['preview_id'],p['preview_digest'],True,'test-user-confirmation')
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures=[pool.submit(apply) for _ in range(2)]
+        results=[future.result(timeout=20) for future in futures]
+    assert results[0]==results[1] and results[0]['applied']
+    with admin.transaction(read_only=True) as tx:
+        assert tx.one('SELECT count(*) AS n FROM tm_calendar.events WHERE calendar_id=%s::uuid',(c,))['n']==1
+        assert tx.one('SELECT count(*) AS n FROM tm_v24.operations WHERE operation=%s AND request_key=%s',('apply',key))['n']==1
+
+def test_preview_payload_cannot_change_under_existing_request_key(setup):
+    admin,e,owner,viewer,pw,c=setup;key,p=pending_event(e,c)
+    changed={'operation':'create_calendar_event','calendar_id':c,'dedupe_key':key,
+             'changes':EVENT|{'title':'Altered synthetic input'},'evidence':USER}
+    with pytest.raises(Rejected,match='request_key_collision'):
+        e.preview(key,[changed])
+    assert_preview_has_no_effects(admin,c,key,p)
+
+def test_api_role_cannot_read_password_hash_or_disable_append_only_audit(setup):
+    import psycopg
+    admin,e,owner,viewer,pw,c=setup
+    with e.database.transaction(read_only=True) as tx:
+        role=tx.one('SELECT rolsuper,rolcreaterole,rolcreatedb,rolbypassrls FROM pg_roles WHERE rolname=current_user')
+        assert not any(role.values()),'Acceptance must use the nonprivileged API role'
+    with pytest.raises(psycopg.errors.InsufficientPrivilege):
+        with e.database.transaction(read_only=True) as tx:
+            tx.one('SELECT password_hash FROM tm_calendar.users LIMIT 1')
+    with pytest.raises(psycopg.errors.InsufficientPrivilege):
+        with e.database.transaction() as tx:
+            tx.execute('ALTER TABLE tm_v24.audit DISABLE TRIGGER ALL')
+
+@pytest.mark.parametrize('attempt',range(3))
+def test_concurrent_conflicting_confirmation_has_one_winner(setup,attempt):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    admin,e,owner,viewer,pw,c=setup;key,p=pending_event(e,c)
+    barrier=Barrier(2)
+    def apply(confirmation):
+        barrier.wait(timeout=5)
+        try:
+            return e.apply(key,p['preview_id'],p['preview_digest'],True,confirmation)
+        except Rejected as exc:
+            return exc.code
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures=[pool.submit(apply,'synthetic-confirmation-'+str(i)) for i in range(2)]
+        results=[future.result(timeout=20) for future in futures]
+    assert sum(isinstance(r,dict) and r['applied'] for r in results)==1
+    assert sum(r=='request_key_collision' for r in results)==1
+    with admin.transaction(read_only=True) as tx:
+        assert tx.one('SELECT count(*) AS n FROM tm_calendar.events WHERE calendar_id=%s::uuid',(c,))['n']==1
+        assert tx.one('SELECT count(*) AS n FROM tm_v24.operations WHERE operation=%s AND request_key=%s',('apply',key))['n']==1
 
 def test_move_event_preserves_identity_and_updates_both_calendar_sync_logs(setup):
     admin,e,owner,viewer,pw,c1=setup
