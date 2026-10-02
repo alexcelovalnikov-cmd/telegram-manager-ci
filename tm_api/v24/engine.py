@@ -85,9 +85,10 @@ class Engine:
             if operation in FINANCE_OPS:return self.finance
             if operation in MEDIA_OPS:return self.media
             return self.reminders
-        if self.configurable and not operation.startswith(('create_calendar','update_calendar','delete_calendar','set_calendar')) and operation!='update_payment':
+        calendar_operation = operation.startswith(('create_calendar','update_calendar','delete_calendar','set_calendar')) or operation == 'move_calendar_event'
+        if self.configurable and not calendar_operation and operation!='update_payment':
             return self.managed
-        return self.calendar if m['operation'].startswith(('create_calendar','update_calendar','delete_calendar','set_calendar')) else self.business
+        return self.calendar if calendar_operation else self.business
     def transaction_lock(self,tx,write):
         if self.configurable:
             from tm_calendar.repository import lock

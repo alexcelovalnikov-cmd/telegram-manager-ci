@@ -60,3 +60,9 @@ def test_applied_preview_returns_original_result_without_new_effects():
         expires_at=(datetime.now(timezone.utc) - timedelta(days=1)).isoformat())
     assert boundary_engine(row).apply_in_transaction(
         object(), "synthetic-preview", "a" * 64, "synthetic-confirmation") is row["result"]
+
+
+@pytest.mark.parametrize("configurable", [False, True])
+def test_event_move_uses_calendar_permissions_in_both_engine_modes(configurable):
+    engine = Engine(None, "synthetic-calendar-instance", configurable=configurable)
+    assert engine.planner({"operation": "move_calendar_event"}) is engine.calendar
