@@ -74,7 +74,7 @@ def main():
                         'recoder_test', 'lstm_layer_test']
         targets = ' '.join(native_tests)
         test_pattern = '^(' + '|'.join(native_tests) + ')$'
-        common = '-DBUILD_SHARED_LIBS=ON -DBUILD_TESTS=ON -DBUILD_TRAINING_TOOLS=OFF -DDISABLE_ARCHIVE=ON -DDISABLE_CURL=ON -DGRAPHICS_DISABLED=ON -DENABLE_NATIVE=OFF -DCMAKE_INSTALL_LIBDIR=lib'
+        common = '-DBUILD_SHARED_LIBS=OFF -DBUILD_TESTS=ON -DBUILD_TRAINING_TOOLS=OFF -DDISABLE_ARCHIVE=ON -DDISABLE_CURL=ON -DGRAPHICS_DISABLED=ON -DENABLE_NATIVE=OFF -DCMAKE_INSTALL_LIBDIR=lib'
         lines += ['RUN apt-get update && apt-get install -y --no-install-recommends git build-essential cmake pkg-config libleptonica-dev libtiff-dev libicu-dev && rm -rf /var/lib/apt/lists/*',
                   'RUN git init /tesseract-source && git -C /tesseract-source remote add origin https://github.com/tesseract-ocr/tesseract.git && git -C /tesseract-source fetch --depth=1 origin ' + native_source + ' && git -C /tesseract-source checkout --detach FETCH_HEAD && test "$(git -C /tesseract-source rev-parse HEAD)" = ' + native_source,
                   'RUN git init /tesseract-source/unittest/third_party/googletest && git -C /tesseract-source/unittest/third_party/googletest remote add origin https://github.com/google/googletest.git && git -C /tesseract-source/unittest/third_party/googletest fetch --depth=1 origin ' + gtest_source + ' && git -C /tesseract-source/unittest/third_party/googletest checkout --detach FETCH_HEAD && test "$(git -C /tesseract-source/unittest/third_party/googletest rev-parse HEAD)" = ' + gtest_source,
@@ -82,7 +82,7 @@ def main():
                   'RUN cd /tesseract-release && ctest --no-tests=error --output-on-failure --output-junit /native-release-tests.xml -R "' + test_pattern + '"',
                   'RUN cmake -S /tesseract-source -B /tesseract-sanitized -DCMAKE_BUILD_TYPE=Debug ' + common + ' -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined" -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined" && cmake --build /tesseract-sanitized --parallel 2 --target ' + targets,
                   'RUN cd /tesseract-sanitized && ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 ctest --no-tests=error --output-on-failure --output-junit /native-sanitized-tests.xml -R "' + test_pattern + '"',
-                  'RUN mkdir -p /tesseract-runtime/bin /tesseract-runtime/lib /tesseract-runtime/licenses && cp /tesseract-release/bin/tesseract /tesseract-runtime/bin/ && cp -a /tesseract-release/libtesseract.so* /tesseract-runtime/lib/ && cp /tesseract-source/LICENSE /tesseract-runtime/licenses/LICENSE && git -C /tesseract-source archive HEAD > /native-source.tar && git -C /tesseract-source/unittest/third_party/googletest archive HEAD > /native-test-source.tar']
+                  'RUN mkdir -p /tesseract-runtime/bin /tesseract-runtime/licenses && cp /tesseract-release/bin/tesseract /tesseract-runtime/bin/ && cp /tesseract-source/LICENSE /tesseract-runtime/licenses/LICENSE && git -C /tesseract-source archive HEAD > /native-source.tar && git -C /tesseract-source/unittest/third_party/googletest archive HEAD > /native-test-source.tar']
     if component == 'whatsapp':
         node_hash = 'df450af89261115ef9f9e3830c3eeb2cc9213b63c720b1af623cb5dcbe2e02de'
         node_release_fingerprint = '5BE8A3F6C8A5C01D106C0AD820B1A390B168D356'
@@ -120,9 +120,7 @@ def main():
             lines += ['RUN apt-get update && apt-get -o Dir::Cache::archives=/dependency-debs/ -o APT::Keep-Downloaded-Packages=true install -y --no-install-recommends python3.12 liblept5 libstdc++6 libxml2 tesseract-ocr-rus tesseract-ocr-eng libgomp1 ca-certificates tor fonts-dejavu-core && dpkg --compare-versions "$(dpkg-query -W -f=\'${Version}\' libxml2)" ge 2.9.14+dfsg-1.3ubuntu3.9 && rm -rf /var/lib/apt/lists/*',
                       'COPY --from=deps-build /opt/tm-python /opt/tm-python',
                       'COPY --from=deps-build /tesseract-runtime/bin/tesseract /usr/local/bin/tesseract',
-                      'COPY --from=deps-build /tesseract-runtime/lib/ /usr/local/lib/',
                       'COPY --from=deps-build /tesseract-runtime/licenses/ /usr/local/share/licenses/tesseract/',
-                      'RUN ldconfig',
                       'RUN /opt/tm-python/bin/python -m pip uninstall -y pip && ln -s /opt/tm-python/bin/python /usr/local/bin/python',
                       'ENV PATH=/opt/tm-python/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
                       'ENV TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata',
