@@ -4,7 +4,7 @@ av==15.1.0
 numpy==2.0.2
 faster-whisper==1.2.1
 PyMuPDF==1.26.4
-Pillow==11.3.0
+Pillow==12.3.0
 pytesseract==0.3.13
 qrcode==8.2
 PySocks==1.7.1
