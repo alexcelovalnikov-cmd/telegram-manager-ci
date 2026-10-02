@@ -128,9 +128,9 @@ def changed(tx,calendar_id,href,deleted):
     c=tx.one('UPDATE tm_calendar.calendars SET revision=revision+1,updated_at=clock_timestamp() WHERE id=%s::uuid RETURNING revision',(calendar_id,))
     tx.execute('INSERT INTO tm_calendar.changes(calendar_id,revision,href,deleted) VALUES(%s::uuid,%s,%s,%s)',(calendar_id,c['revision'],href,deleted))
 
-def delete(tx,name,ident,expected_revision,*,bridge=True):
+def delete(tx,name,ident,expected_revision):
     row=event(tx,name,ident,write=True);check_revision(row['revision'],expected_revision)
-    if row.get('component_type')=='VTODO' and bridge:
+    if row.get('component_type')=='VTODO':
         from tm_reminders.bridge import incoming_delete
         incoming_delete(tx,name,row)
     tx.execute('UPDATE tm_calendar.events SET deleted_at=clock_timestamp(),updated_at=clock_timestamp(),revision=revision+1,updated_by=%s WHERE id=%s::uuid',(name,ident))

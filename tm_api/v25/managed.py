@@ -114,10 +114,7 @@ class ManagedBusiness:
         # the user Reminder projection.
         if p['entity']=='project' and a.get('project_archived_at'):
             if previous and previous.get('deleted_at') is None:
-                # Internal projection cleanup must not re-enter the inbound
-                # CalDAV bridge and mutate the same project a second time.
-                calendars.delete(tx,user,rid,previous['revision'],bridge=False)
-                tx.execute('UPDATE tm_config.reminder_bindings SET hidden=true WHERE task_id=%s',(ident,))
+                calendars.delete(tx,user,rid,previous['revision'])
             elif old:
                 tx.execute('UPDATE tm_config.reminder_bindings SET hidden=true WHERE task_id=%s',(ident,))
             return
