@@ -1,0 +1,16 @@
+{
+  "contract_version": "telegram-manager-public-dependency-inputs/v1",
+  "canonical_source": "e0e743d73c26bf1be7dc30aa6dc1590ac40e3a3e",
+  "files": {
+    "requirements.lock": "0a30f8175ac5b970164636b90eb6c04c75f2d1b6f73bcd1943065ffc0e57ed29",
+    "requirements.v24.txt": "1faeb92af7c30268e63903f00f9e0b5f63bcbbb1dc919400975148cc514f03d3",
+    "requirements.calendar.txt": "c5a63e25d70060f85ca1926ced112ac6a842a5bd636dddccb0c6cb8e3ea5eb66",
+    "requirements.worker.txt": "6779ada99082adc4624abf7583b68473b20512964e1cfc884394ffac20f04700",
+    "whatsapp/package.json": "a335d48e21d60b0432750861f61e3a81232a5d7ebc5f3aaaa5358d3654769a89",
+    "whatsapp/package-lock.json": "618f041821f2d5e83054d96e184db9e8ab0a41feb5afcc476d03544ab68d55da",
+    "whatsapp/patches/@whiskeysockets+baileys+7.0.0-rc14.patch": "99a26457fd54ec502f2ba5ca81d5f5bdf51bc758a3cb99ed9d06571d1590639b"
+  },
+  "application_source_exported": false,
+  "credentials_exported": false,
+  "production_ready": false
+}

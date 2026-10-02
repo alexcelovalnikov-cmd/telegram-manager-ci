@@ -1,9 +1,0 @@
-{
-  "schema": 1,
-  "transformer_version": 2,
-  "source_sha": "e0e743d73c26bf1be7dc30aa6dc1590ac40e3a3e",
-  "sanitized_content_sha256": "879bd8cd28dae70900a0bc8948fd6b6c8c40f118e879dd3312f6a5c55e8684a0",
-  "policy_sha256": "0a73e445ee98029526be8c2e6c3a2de68097de42fe5a93fd972673f7797badcc",
-  "files": 305,
-  "production_artifact": false
-}
