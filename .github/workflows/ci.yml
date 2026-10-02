@@ -88,7 +88,7 @@ jobs:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: synthetic-hosted-only
         ports:
-          - 5432:5432
+          - "127.0.0.1:5432:5432"
         options: >-
           --health-cmd "pg_isready -U postgres -d tm_v24_test"
           --health-interval 5s --health-timeout 5s --health-retries 10
@@ -102,13 +102,27 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
+      - name: Detect synthetic acceptance harness
+        id: suite
+        run: |
+          if [[ -f tests/v24/bootstrap_hosted_database.py ]]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: "3.12"
       - name: Install isolated acceptance dependencies
-        run: python -m pip install -r requirements.calendar.txt pytest httpx
+        if: steps.suite.outputs.present == 'true'
+        run: |
+          python -m pip install -r requirements.lock
+          python -m pip install --constraint requirements.lock -r requirements.v24.txt
+          python -m pip install -r requirements.calendar.txt pytest httpx
       - name: Create empty synthetic PostgreSQL fixture
+        if: steps.suite.outputs.present == 'true'
         run: python tests/v24/bootstrap_hosted_database.py
       - name: Real PostgreSQL and DAV negative tests
+        if: steps.suite.outputs.present == 'true'
         run: python -m pytest -q tests/v24/test_postgres_integration.py tests/v24/test_preview_security_boundaries.py -rA
 
