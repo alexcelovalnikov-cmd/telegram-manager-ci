@@ -54,4 +54,7 @@ Licensed under the MIT License. See [LICENSE](LICENSE).
 Do not treat this repository as a production release artifact. Production releases are built only
 from the private canonical source through the project's separate guarded release process.
 
+Generic installation labels: system user: `telegram-manager`; SSH alias: `telegram-server`.
+These labels contain no credentials or access instructions.
+
 The repository may be ahead of production.
