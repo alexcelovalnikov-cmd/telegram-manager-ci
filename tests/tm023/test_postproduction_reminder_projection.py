@@ -63,7 +63,7 @@ def test_active_corrections_use_canonical_next_action():
         "mode": "open",
         "state": "active",
         "title": "Внести правки — Бивол / Intro",
-        "description": "Конкретное действие по монтажу из canonical Postproduction state.",
+        "description": "Есть конкретное действие по монтажу.",
     }
 
 
@@ -112,6 +112,7 @@ def test_non_pov_active_color_uses_canonical_action():
     )
     assert decision["mode"] == "open"
     assert decision["title"] == "Сделать цвет — RCC MMA 25 / Intro"
+    assert decision["description"] == "Цвет ещё не готов."
 
 
 def test_pov_color_is_not_applicable_even_without_item():
