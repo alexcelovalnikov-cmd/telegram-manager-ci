@@ -1,0 +1,8 @@
+ARG API_IMAGE=telegram-manager:V24
+FROM ${API_IMAGE}
+USER root
+COPY requirements.calendar.txt /tmp/requirements.calendar.txt
+RUN pip install --no-cache-dir --constraint /app/requirements.lock -r /tmp/requirements.calendar.txt pytest==8.4.2 pytest-asyncio==1.2.0 && pip check
+COPY tests /app/tests
+COPY deploy/v24/radicale.conf /etc/radicale/config
+CMD ["python","-m","pytest","tests/v24","-q"]

@@ -1,0 +1,76 @@
+name: Public sanitized CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.lock
+            requirements.v24.txt
+            requirements.calendar.txt
+            requirements.worker.txt
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.lock
+          python -m pip install --constraint requirements.lock -r requirements.v24.txt
+          python -m pip install -r requirements.calendar.txt
+          python -m pip install pytest pytest-asyncio
+
+      - name: Python syntax
+        run: python -m compileall -q tm_api tm_calendar tm_reminders mac worker tests
+
+      - name: Shell syntax
+        run: bash -n deploy/v31/*.sh deploy/ops/*.sh deploy/ops/tmctl-root whatsapp/*.sh
+
+      - name: V31 compose syntax
+        env:
+          TM_PROJECT_NAME: telegram-manager-v31-ci
+          TM_API_IMAGE: telegram-manager:V31
+          TM_CALENDAR_IMAGE: telegram-manager-calendar:V31
+          TM_API_ENV_FILE: /tmp/tm-api.env
+          TM_API_DSN_FILE: /tmp/tm-api-dsn.env
+          TM_CALENDAR_ENV_FILE: /tmp/tm-calendar.env
+          TM_STATE_DIR: /tmp/tm-state
+          TM_DATABASE_NETWORK: telegram-manager_database
+        run: |
+          touch "$TM_API_ENV_FILE" "$TM_API_DSN_FILE" "$TM_CALENDAR_ENV_FILE"
+          mkdir -p "$TM_STATE_DIR"
+          docker compose -f deploy/v31/compose.production.yaml config -q
+
+      - name: Server worker image
+        run: docker build -f Dockerfile.worker -t telegram-manager-worker:ci .
+
+      - name: WhatsApp collector image
+        run: docker build -f Dockerfile.whatsapp -t telegram-manager-whatsapp:ci .
+
+      - name: Python tests
+        run: python -m pytest -q
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: JavaScript tests
+        run: |
+          node --check whatsapp/collector.mjs
+          node --test tests/review_ui.test.js
+          node --test tests/reconciliation_ui.test.js
+          node --test tests/v24/review_ui.test.js

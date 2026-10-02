@@ -1,0 +1,11 @@
+[Unit]
+Description=Telegram Manager PostgreSQL backup
+After=docker.service
+Requires=docker.service
+[Service]
+Type=oneshot
+UMask=0077
+ExecStart=/usr/bin/python3 /opt/telegram-manager/releases/V20/deploy/backup_database.py
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true

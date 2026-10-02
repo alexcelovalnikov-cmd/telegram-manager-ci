@@ -1,0 +1,4 @@
+# Additions only. Existing server V22 dependencies remain constrained by requirements.lock.
+psycopg[binary]==3.3.3
+icalendar==6.3.2
+cryptography==50.0.1

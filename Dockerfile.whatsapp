@@ -1,0 +1,19 @@
+FROM node:20-bookworm-slim
+ENV NODE_ENV=production \
+    TM_WHATSAPP_STATE_DIR=/state
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates git python3 make g++ tor \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY whatsapp/package.json whatsapp/package-lock.json ./
+COPY whatsapp/patches ./patches
+RUN git config --global url."https://github.com/".insteadOf ssh://git@github.com/ \
+ && git config --global --add url."https://github.com/".insteadOf git@github.com: \
+ && npm ci --include=dev \
+ && npm prune --omit=dev \
+ && npm cache clean --force
+COPY whatsapp/collector.mjs whatsapp/start.sh ./
+RUN chmod 755 /app/start.sh \
+ && useradd --uid 10001 --create-home --shell /usr/sbin/nologin tmwhatsapp
+USER 10001
+CMD ["/app/start.sh"]

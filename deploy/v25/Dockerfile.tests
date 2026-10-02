@@ -1,0 +1,15 @@
+ARG BASE_IMAGE=telegram-manager:V22
+FROM ${BASE_IMAGE}
+USER root
+WORKDIR /app
+COPY requirements.lock requirements.v24.txt requirements.calendar.txt /tmp/tm-v28/
+RUN pip install --no-cache-dir --constraint /tmp/tm-v28/requirements.lock -r /tmp/tm-v28/requirements.v24.txt -r /tmp/tm-v28/requirements.calendar.txt pytest==8.4.2 pytest-asyncio==1.2.0 && pip check
+COPY tm_api /app/tm_api
+COPY tm_calendar /app/tm_calendar
+COPY tm_reminders /app/tm_reminders
+COPY tests /app/tests
+COPY Dockerfile /app/Dockerfile
+COPY deploy /app/deploy
+COPY examples /app/examples
+COPY deploy/v25/radicale.conf /etc/radicale/config
+CMD ["python","-m","pytest","tests/v24","tests/v25","-q"]

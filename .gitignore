@@ -1,0 +1,51 @@
+# Local environments and generated caches
+.venv/
+venv/
+node_modules/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage*
+htmlcov/
+# macOS metadata
+.DS_Store
+__MACOSX/
+._*
+# Credentials, runtime files, real database snapshots
+.env
+.env.*
+*.env
+*.env.*
+!.env.example
+!*.env.example
+!*.env.template
+.staging/
+secrets/
+.ssh/
+state/
+logs/
+backups/
+*.key
+*.pem
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+*.session*
+*.sqlite*
+*.db
+*.dump
+*.backup
+*.log
+*.token
+credentials*.json
+service-account*.json
+connection-preview.png
+# Local build packages and generated machine-specific export
+*.tgz
+*.tar.gz
+*.zip
+Telegram_Manager_Runtime_*.txt
+Telegram_Manager_Schema_*.sql.gz

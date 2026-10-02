@@ -1,0 +1,2 @@
+# No default production deploy. Use DEPLOY_V25.md and explicit isolated stage.
+services: {}

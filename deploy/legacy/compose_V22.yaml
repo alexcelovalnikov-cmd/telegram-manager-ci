@@ -1,0 +1,36 @@
+name: telegram-manager
+services:
+  api:
+    build: ..
+    image: telegram-manager:V22
+    restart: unless-stopped
+    env_file: /opt/telegram-manager/secrets/api-v20.env
+    environment:
+      TM_AUDIT_PATH: /state/audit.sqlite
+      TM_WRITES_ENABLED: ${TM_WRITES_ENABLED:-true}
+      TM_OAUTH_ENABLED: ${TM_OAUTH_ENABLED:-true}
+      TM_OAUTH_PATH: /state/oauth.json
+      TM_BACKGROUND_ENABLED: ${TM_BACKGROUND_ENABLED:-true}
+      TM_JOBS_PATH: /state/jobs.sqlite
+    networks: [default, database]
+    ports:
+      - "127.0.0.1:8766:8000"
+    volumes:
+      - /opt/telegram-manager/state:/state
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 256m
+    cpus: 0.5
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "2"
+
+networks:
+  database:
+    external: true
+    name: telegram-manager_database

@@ -1,0 +1,1124 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG=/etc/telegram-manager/tmctl.env
+if [[ ! -r "$CONFIG" ]]; then
+  echo "ERROR: missing root-owned config $CONFIG" >&2
+  exit 1
+fi
+
+# shellcheck disable=SC1090
+source "$CONFIG"
+
+required=(
+  TM_RELEASE_REPO
+  TM_RELEASE_COMPOSE
+  TM_PREVIOUS_COMPOSE
+  TM_API_IMAGE
+  TM_CALENDAR_IMAGE
+  TM_API_ENV_FILE
+  TM_API_DSN_FILE
+  TM_CALENDAR_ENV_FILE
+  TM_DATABASE_NETWORK
+  TM_STATE_DIR
+)
+for key in "${required[@]}"; do
+  if [[ -z "${!key:-}" ]]; then
+    echo "ERROR: missing config key $key" >&2
+    exit 1
+  fi
+done
+
+production_env() {
+  export TM_PROJECT_NAME="${TM_PROJECT_NAME:-telegram-manager-v31-production}"
+  export TM_API_IMAGE TM_CALENDAR_IMAGE
+  export TM_API_ENV_FILE TM_API_DSN_FILE TM_CALENDAR_ENV_FILE
+  export TM_DATABASE_NETWORK TM_STATE_DIR
+  export TM_API_PORT="${TM_API_PORT:-8766}"
+  export TM_CALENDAR_PORT="${TM_CALENDAR_PORT:-5232}"
+  export TM_WRITES_ENABLED=true
+  export TM_BACKGROUND_ENABLED=true
+  export TM_OAUTH_ENABLED=true
+}
+
+container_exists() {
+  docker inspect "$1" >/dev/null 2>&1
+}
+
+PROJECT_OPERATOR="${TM_OPERATOR_USER:-telegram-manager}"
+WORKER_ROOT=/opt/telegram-manager/runtime/worker
+WORKER_STAGE="${TM_WORKER_STAGE:-/opt/telegram-manager/staging/worker}"
+WORKER_CONTAINER=telegram-manager-worker
+WORKER_LOGIN_CONTAINER=telegram-manager-worker-login
+DEPLOY_LOCK="${TM_DEPLOY_LOCK:-/run/lock/telegram-manager.deploy.lock}"
+HISTORICAL_CLEANUP_PREVIEW="${TM_HISTORICAL_CLEANUP_PREVIEW:-/run/telegram-manager-historical-cleanup.preview}"
+WHATSAPP_CONTAINER=telegram-manager-whatsapp
+WHATSAPP_STAGE="${TM_WHATSAPP_STAGE:-/opt/telegram-manager/staging/whatsapp}"
+
+whatsapp_namespace_matches_worker() {
+  local worker_id whatsapp_network_mode
+  container_exists "$WORKER_CONTAINER" || return 1
+  container_exists "$WHATSAPP_CONTAINER" || return 1
+  worker_id="$(docker inspect "$WORKER_CONTAINER" --format '{{.Id}}' 2>/dev/null || true)"
+  whatsapp_network_mode="$(docker inspect "$WHATSAPP_CONTAINER" --format '{{.HostConfig.NetworkMode}}' 2>/dev/null || true)"
+  [[ -n "$worker_id" && ( "$whatsapp_network_mode" == "container:$worker_id" || "$whatsapp_network_mode" == "container:$WORKER_CONTAINER" ) ]]
+}
+
+with_deploy_lock() {
+  exec 9>"$DEPLOY_LOCK"
+  if ! flock -n 9; then
+    echo "ERROR: another Telegram Manager deploy/rollback is already running" >&2
+    return 75
+  fi
+  "$@"
+}
+
+historical_cleanup_current_project() {
+  local current_project="${TM_PROJECT_NAME:-telegram-manager-v31-production}"
+  [[ "$current_project" =~ ^telegram-manager-v([0-9]+)-production$ ]] || {
+    echo "ERROR: current production project has unexpected name: $current_project" >&2
+    return 1
+  }
+  printf '%s\n' "$current_project"
+}
+
+historical_cleanup_rollback_project() {
+  local current_project current_version name version api calendar best=-1
+  current_project="$(historical_cleanup_current_project)" || return 1
+  [[ "$current_project" =~ ^telegram-manager-v([0-9]+)-production$ ]]
+  current_version="${BASH_REMATCH[1]}"
+
+  while IFS= read -r name; do
+    [[ "$name" =~ ^telegram-manager-v([0-9]+)-production-api-1$ ]] || continue
+    version="${BASH_REMATCH[1]}"
+    (( version < current_version )) || continue
+    api="telegram-manager-v${version}-production-api-1"
+    calendar="telegram-manager-v${version}-production-calendar-1"
+    container_exists "$api" || continue
+    container_exists "$calendar" || continue
+    (( version > best )) && best="$version"
+  done < <(docker ps -a --format '{{.Names}}' | LC_ALL=C sort)
+
+  if (( best >= 0 )); then
+    printf 'telegram-manager-v%s-production\n' "$best"
+  fi
+}
+
+historical_cleanup_candidates() {
+  local current_project rollback_project name status
+  current_project="$(historical_cleanup_current_project)" || return 1
+  rollback_project="$(historical_cleanup_rollback_project)" || return 1
+  while IFS= read -r name; do
+    [[ "$name" =~ ^telegram-manager-v[0-9]+-production-(api|calendar)-1$ ]] || continue
+    [[ "$name" != "$current_project-api-1" && "$name" != "$current_project-calendar-1" ]] || continue
+    if [[ -n "$rollback_project" ]]; then
+      [[ "$name" != "$rollback_project-api-1" && "$name" != "$rollback_project-calendar-1" ]] || continue
+    fi
+    status="$(docker inspect "$name" --format '{{.State.Status}}')"
+    [[ "$status" == "exited" ]] || continue
+    printf '%s\n' "$name"
+  done < <(docker ps -a --format '{{.Names}}' | LC_ALL=C sort)
+}
+
+historical_cleanup_preview() {
+  local current_project rollback_project tmp payload_digest name cid image
+  local -a names=()
+  current_project="$(historical_cleanup_current_project)" || return 1
+  rollback_project="$(historical_cleanup_rollback_project)" || return 1
+  [[ -n "$rollback_project" ]] || {
+    echo "ERROR: no complete historical rollback release found" >&2
+    return 1
+  }
+  mapfile -t names < <(historical_cleanup_candidates)
+  tmp="${HISTORICAL_CLEANUP_PREVIEW}.tmp"
+  umask 077
+  {
+    printf 'active_project=%s\n' "$current_project"
+    printf 'rollback_project=%s\n' "$rollback_project"
+    for name in "${names[@]}"; do
+      cid="$(docker inspect "$name" --format '{{.Id}}')"
+      image="$(docker inspect "$name" --format '{{.Config.Image}}')"
+      printf 'container=%s|id=%s|image=%s|status=exited\n' "$name" "$cid" "$image"
+    done
+  } > "$tmp"
+  payload_digest="$(sha256sum "$tmp" | awk '{print $1}')"
+  {
+    printf 'digest=%s\n' "$payload_digest"
+    cat "$tmp"
+  } > "$HISTORICAL_CLEANUP_PREVIEW"
+  rm -f -- "$tmp"
+  chmod 600 "$HISTORICAL_CLEANUP_PREVIEW"
+  printf 'HISTORICAL_CLEANUP_PREVIEW digest=%s count=%s active_project=%s rollback_project=%s\n' "$payload_digest" "${#names[@]}" "$current_project" "$rollback_project"
+  tail -n +4 "$HISTORICAL_CLEANUP_PREVIEW"
+}
+
+historical_cleanup_apply() {
+  local requested_digest="$1"
+  local current_project rollback_project stored_digest actual_digest active_line rollback_line
+  local line name id_field image_field status_field cid status count=0
+  local -a names=()
+  [[ "$requested_digest" =~ ^[a-f0-9]{64}$ ]] || {
+    echo "ERROR: historical cleanup digest must be 64 lowercase hex characters" >&2
+    return 2
+  }
+  [[ -f "$HISTORICAL_CLEANUP_PREVIEW" && ! -L "$HISTORICAL_CLEANUP_PREVIEW" ]] || {
+    echo "ERROR: no historical cleanup preview exists" >&2
+    return 1
+  }
+
+  current_project="$(historical_cleanup_current_project)" || return 1
+  rollback_project="$(historical_cleanup_rollback_project)" || return 1
+  [[ -n "$rollback_project" ]] || {
+    echo "ERROR: no complete historical rollback release found" >&2
+    return 1
+  }
+
+  stored_digest="$(sed -n '1s/^digest=//p' "$HISTORICAL_CLEANUP_PREVIEW")"
+  actual_digest="$(tail -n +2 "$HISTORICAL_CLEANUP_PREVIEW" | sha256sum | awk '{print $1}')"
+  [[ "$requested_digest" == "$stored_digest" && "$requested_digest" == "$actual_digest" ]] || {
+    echo "ERROR: historical cleanup preview digest mismatch" >&2
+    return 1
+  }
+  active_line="$(sed -n '2p' "$HISTORICAL_CLEANUP_PREVIEW")"
+  rollback_line="$(sed -n '3p' "$HISTORICAL_CLEANUP_PREVIEW")"
+  [[ "$active_line" == "active_project=$current_project" ]] || {
+    echo "ERROR: historical cleanup preview is stale after production project change" >&2
+    return 1
+  }
+  [[ "$rollback_line" == "rollback_project=$rollback_project" ]] || {
+    echo "ERROR: historical cleanup preview is stale after rollback release change" >&2
+    return 1
+  }
+
+  while IFS='|' read -r line id_field image_field status_field; do
+    [[ -n "$line" ]] || continue
+    name="${line#container=}"
+    [[ "$line" == "container=$name" ]] || { echo "ERROR: invalid historical cleanup preview line" >&2; return 1; }
+    [[ "$name" =~ ^telegram-manager-v[0-9]+-production-(api|calendar)-1$ ]] || {
+      echo "ERROR: invalid historical container name: $name" >&2
+      return 1
+    }
+    [[ "$name" != "$current_project-api-1" && "$name" != "$current_project-calendar-1" ]] || {
+      echo "ERROR: refusing to remove current production container: $name" >&2
+      return 1
+    }
+    [[ "$name" != "$rollback_project-api-1" && "$name" != "$rollback_project-calendar-1" ]] || {
+      echo "ERROR: refusing to remove rollback production container: $name" >&2
+      return 1
+    }
+    [[ "$status_field" == "status=exited" ]] || { echo "ERROR: invalid planned status for $name" >&2; return 1; }
+    container_exists "$name" || { echo "ERROR: planned container disappeared: $name" >&2; return 1; }
+    cid="$(docker inspect "$name" --format '{{.Id}}')"
+    [[ "$id_field" == "id=$cid" ]] || { echo "ERROR: planned container identity changed: $name" >&2; return 1; }
+    status="$(docker inspect "$name" --format '{{.State.Status}}')"
+    [[ "$status" == "exited" ]] || { echo "ERROR: planned container is no longer exited: $name" >&2; return 1; }
+    names+=("$name")
+  done < <(tail -n +4 "$HISTORICAL_CLEANUP_PREVIEW")
+
+  for name in "${names[@]}"; do
+    docker rm "$name" >/dev/null
+    count=$((count + 1))
+  done
+  rm -f -- "$HISTORICAL_CLEANUP_PREVIEW"
+  printf 'HISTORICAL_CLEANUP_APPLY_OK digest=%s removed=%s rollback_project=%s\n' "$requested_digest" "$count" "$rollback_project"
+}
+
+worker_import() {
+  [[ -f "$WORKER_STAGE/worker.env" && ! -L "$WORKER_STAGE/worker.env" ]] || {
+    echo "ERROR: missing staged worker.env" >&2; return 1;
+  }
+  [[ -d "$WORKER_STAGE/whisper-small" && ! -L "$WORKER_STAGE/whisper-small" ]] || {
+    echo "ERROR: missing staged whisper-small model" >&2; return 1;
+  }
+  if grep -Eq '^TM_OPENAI_VISION_' "$WORKER_STAGE/worker.env"; then
+    echo "ERROR: cloud vision settings belong in separate staged vision.env" >&2
+    return 1
+  fi
+  if find "$WORKER_STAGE/whisper-small" -type l -print -quit | grep -q .; then
+    echo "ERROR: symlinks are not allowed in staged model" >&2
+    return 1
+  fi
+  install -d -m 700 "$WORKER_ROOT"
+  install -d -m 700 -o 10001 -g 10001 "$WORKER_ROOT/state"
+  install -d -m 755 "$WORKER_ROOT/models"
+  install -d -m 1777 -o root -g root "$WORKER_ROOT/tmp"
+  install -m 600 -o root -g root "$WORKER_STAGE/worker.env" "$WORKER_ROOT/worker.env"
+  if [[ -f "$WORKER_STAGE/vision.env" && ! -L "$WORKER_STAGE/vision.env" ]]; then
+    python3 - "$WORKER_STAGE/vision.env" <<'PYVISION'
+from pathlib import Path
+import sys
+path=Path(sys.argv[1])
+allowed={'TM_OPENAI_VISION_ENABLED','TM_OPENAI_VISION_MODEL','TM_OPENAI_VISION_API_KEY'}
+values={}
+for raw in path.read_text().splitlines():
+    line=raw.strip()
+    if not line or line.startswith('#'):
+        continue
+    if '=' not in line:
+        raise SystemExit('ERROR: invalid vision.env line')
+    key,value=line.split('=',1)
+    key=key.strip(); value=value.strip()
+    if key not in allowed or key in values:
+        raise SystemExit('ERROR: invalid/duplicate vision.env key')
+    values[key]=value
+enabled=values.get('TM_OPENAI_VISION_ENABLED','').lower()
+if enabled not in ('0','1','false','true','no','yes','off','on'):
+    raise SystemExit('ERROR: TM_OPENAI_VISION_ENABLED is required and must be boolean')
+model=values.get('TM_OPENAI_VISION_MODEL','gpt-5.6-luna')
+if model not in ('gpt-5.6-luna','gpt-5.6-terra','gpt-5.6-sol'):
+    raise SystemExit('ERROR: vision model is not allowlisted')
+if enabled in ('1','true','yes','on') and len(values.get('TM_OPENAI_VISION_API_KEY','')) < 20:
+    raise SystemExit('ERROR: enabled cloud vision requires a dedicated API key')
+PYVISION
+    install -m 600 -o root -g root "$WORKER_STAGE/vision.env" "$WORKER_ROOT/vision.env"
+  fi
+  rm -rf "$WORKER_ROOT/models/whisper-small.next"
+  cp -a "$WORKER_STAGE/whisper-small" "$WORKER_ROOT/models/whisper-small.next"
+  chown -R root:root "$WORKER_ROOT/models/whisper-small.next"
+  find "$WORKER_ROOT/models/whisper-small.next" -type d -exec chmod 755 {} +
+  find "$WORKER_ROOT/models/whisper-small.next" -type f -exec chmod 444 {} +
+  rm -rf "$WORKER_ROOT/models/whisper-small"
+  mv "$WORKER_ROOT/models/whisper-small.next" "$WORKER_ROOT/models/whisper-small"
+  if [[ -f "$WORKER_STAGE/telegram_helper.session" && ! -L "$WORKER_STAGE/telegram_helper.session" ]]; then
+    install -m 600 -o 10001 -g 10001 "$WORKER_STAGE/telegram_helper.session" "$WORKER_ROOT/state/telegram_helper.session"
+  fi
+  echo "WORKER_IMPORT_OK model=$(du -sh "$WORKER_ROOT/models/whisper-small" | awk '{print $1}') session=$([[ -f "$WORKER_ROOT/state/telegram_helper.session" ]] && echo present || echo missing) vision=$([[ -f "$WORKER_ROOT/vision.env" ]] && echo configured || echo absent)"
+}
+
+vision_credentials_import() {
+  local stage=/opt/telegram-manager/staging/vision.env
+  local target="$WORKER_ROOT/vision.env"
+  [[ -f "$stage" && ! -L "$stage" ]] || {
+    echo "ERROR: missing staged vision.env: $stage" >&2
+    return 1
+  }
+  [[ "$(stat -c '%a' "$stage")" == "600" ]] || {
+    echo "ERROR: staged vision.env must have mode 600" >&2
+    return 1
+  }
+  local summary
+  summary="$(python3 - "$stage" <<'PYVISIONIMPORT'
+from pathlib import Path
+import sys
+path=Path(sys.argv[1])
+if path.stat().st_size<=0 or path.stat().st_size>12000:
+    raise SystemExit('ERROR: invalid vision.env size')
+allowed={'TM_OPENAI_VISION_ENABLED','TM_OPENAI_VISION_MODEL','TM_OPENAI_VISION_API_KEY'}
+values={}
+for raw in path.read_text().splitlines():
+    line=raw.strip()
+    if not line or line.startswith('#'):
+        continue
+    if '=' not in line:
+        raise SystemExit('ERROR: invalid vision.env line')
+    key,value=line.split('=',1); key=key.strip(); value=value.strip()
+    if key not in allowed or key in values:
+        raise SystemExit('ERROR: invalid/duplicate vision.env key')
+    values[key]=value
+enabled=values.get('TM_OPENAI_VISION_ENABLED','').lower()
+if enabled not in ('0','1','false','true','no','yes','off','on'):
+    raise SystemExit('ERROR: TM_OPENAI_VISION_ENABLED is required and must be boolean')
+model=values.get('TM_OPENAI_VISION_MODEL','gpt-5.6-luna')
+if model not in ('gpt-5.6-luna','gpt-5.6-terra','gpt-5.6-sol'):
+    raise SystemExit('ERROR: vision model is not allowlisted')
+if enabled in ('1','true','yes','on') and len(values.get('TM_OPENAI_VISION_API_KEY',''))<20:
+    raise SystemExit('ERROR: enabled cloud vision requires a dedicated API key')
+print('enabled='+('true' if enabled in ('1','true','yes','on') else 'false')+' model='+model)
+PYVISIONIMPORT
+)"
+  install -d -m 700 "$WORKER_ROOT"
+  install -m 600 -o root -g root "$stage" "$target"
+  rm -f -- "$stage"
+  if container_exists "$WORKER_CONTAINER" && docker inspect "$WORKER_CONTAINER" --format '{{.State.Running}}' 2>/dev/null | grep -qx true; then
+    worker_start_image "${TM_WORKER_IMAGE:-}"
+  fi
+  echo "VISION_CREDENTIALS_IMPORT_OK $summary"
+}
+
+worker_start_image() {
+  local image="$1"
+  local -a vision_env=()
+  local whatsapp_should_rebind=false
+  [[ -n "$image" ]] || { echo "ERROR: TM_WORKER_IMAGE is not configured" >&2; return 1; }
+  [[ -f "$WORKER_ROOT/worker.env" ]] || { echo "ERROR: run tmctl worker-import first" >&2; return 1; }
+  [[ -f "$WORKER_ROOT/state/telegram_helper.session" ]] || { echo "ERROR: Telegram session is not imported" >&2; return 1; }
+  [[ -d "$WORKER_ROOT/models/whisper-small" ]] || { echo "ERROR: Whisper model is not imported" >&2; return 1; }
+  install -d -m 1777 -o root -g root "$WORKER_ROOT/tmp"
+  if container_exists "$WORKER_LOGIN_CONTAINER" && docker inspect "$WORKER_LOGIN_CONTAINER" --format '{{.State.Running}}' 2>/dev/null | grep -qx true; then
+    echo "ERROR: finish or stop QR login before starting production worker" >&2
+    return 1
+  fi
+  if [[ "${TM_WHATSAPP_ENABLED:-false}" == "true" ]]; then
+    whatsapp_should_rebind=true
+  fi
+  if container_exists "$WHATSAPP_CONTAINER"; then
+    docker rm -f "$WHATSAPP_CONTAINER" >/dev/null
+  fi
+  if container_exists "$WORKER_CONTAINER"; then
+    docker rm -f "$WORKER_CONTAINER" >/dev/null
+  fi
+  if [[ -f "$WORKER_ROOT/vision.env" ]]; then
+    vision_env=(--env-file "$WORKER_ROOT/vision.env")
+  fi
+  docker run -d     --name "$WORKER_CONTAINER"     --restart unless-stopped     --read-only     --mount type=bind,src="$WORKER_ROOT/tmp",dst=/tmp     --cap-drop ALL     --security-opt no-new-privileges:true     --init     --stop-timeout 30     --memory 1100m     --cpus 1.0     --env-file "$WORKER_ROOT/worker.env"     "${vision_env[@]}"     -e TM_SERVER_WORKER=1     -e TM_TELEGRAM_PROXY_MODE=tor     -e TM_WORKER_STATE_DIR=/state     -e TM_TELEGRAM_SESSION=/state/telegram_helper.session     -e TM_MODELS_HOME=/models-root     -e TM_MODELS_DIR=/models     -e TM_AUDIO_PYTHON=/usr/local/bin/python     -e TM_MEDIA_BACKEND=linux     -e TM_OCR_LANG=rus+eng     -e TM_INSTANCE_ID="${TM_INSTANCE_ID:-macbook-owner}"     -v "$WORKER_ROOT/state:/state"     -v "$WORKER_ROOT/models:/models:ro"     "$image" >/dev/null
+
+  for _ in $(seq 1 150); do
+    if ! docker inspect "$WORKER_CONTAINER" --format '{{.State.Running}}' 2>/dev/null | grep -qx true; then
+      break
+    fi
+    if docker logs "$WORKER_CONTAINER" 2>&1 | grep -F 'TELEGRAM V18 CONNECTED' >/dev/null; then
+      if [[ "$whatsapp_should_rebind" == "true" ]]; then
+        if whatsapp_start_image; then
+          echo "WHATSAPP_REBIND_OK"
+        else
+          echo "WARNING: WhatsApp rebind failed after worker recreation; Telegram worker remains healthy" >&2
+        fi
+      fi
+      echo "WORKER_START_OK image=$image"
+      return 0
+    fi
+    sleep 1
+  done
+  docker logs --tail 80 "$WORKER_CONTAINER" >&2 || true
+  echo "ERROR: worker did not reach Telegram connected state" >&2
+  return 1
+}
+
+worker_stop() {
+  if container_exists "$WHATSAPP_CONTAINER"; then
+    docker rm -f "$WHATSAPP_CONTAINER" >/dev/null || true
+  fi
+  if container_exists "$WORKER_CONTAINER"; then
+    docker stop "$WORKER_CONTAINER" >/dev/null || true
+  fi
+  echo "WORKER_STOP_OK"
+}
+
+whatsapp_start_image() {
+  local image="${TM_WHATSAPP_IMAGE:-}"
+  local state="$TM_STATE_DIR/whatsapp"
+  [[ -n "$image" ]] || { echo "ERROR: TM_WHATSAPP_IMAGE is not configured" >&2; return 1; }
+  container_exists "$WORKER_CONTAINER" || { echo "ERROR: Telegram worker is required for WhatsApp Tor transport" >&2; return 1; }
+  docker inspect "$WORKER_CONTAINER" --format '{{.State.Running}}' 2>/dev/null | grep -qx true || {
+    echo "ERROR: Telegram worker is not running" >&2
+    return 1
+  }
+  docker logs "$WORKER_CONTAINER" 2>&1 | grep -F 'TOR_TRANSPORT_READY' >/dev/null || {
+    echo "ERROR: Telegram worker Tor transport is not ready" >&2
+    return 1
+  }
+  if container_exists "$WHATSAPP_CONTAINER" \
+    && docker inspect "$WHATSAPP_CONTAINER" --format '{{.State.Running}}' 2>/dev/null | grep -qx true \
+    && whatsapp_namespace_matches_worker \
+    && [[ -f "$state/health.json" && ! -L "$state/health.json" ]]     && grep -Eq '"(connected|qr_ready)"[[:space:]]*:[[:space:]]*true' "$state/health.json"; then
+    echo "WHATSAPP_START_OK image=$image reused=true"
+    return 0
+  fi
+  install -d -m 700 -o 10001 -g 10001 "$state"
+  if container_exists "$WHATSAPP_CONTAINER"; then
+    docker rm -f "$WHATSAPP_CONTAINER" >/dev/null
+  fi
+  docker run -d --name "$WHATSAPP_CONTAINER" --restart unless-stopped --read-only \
+    --network "container:$WORKER_CONTAINER" \
+    --tmpfs /tmp:size=64m,mode=1777 --cap-drop ALL --security-opt no-new-privileges:true \
+    --init --stop-timeout 20 --memory 512m --cpus 0.5 \
+    -e TM_WHATSAPP_STATE_DIR=/state \
+    -e TM_WHATSAPP_SOCKS_PROXY=socks5h://127.0.0.1:9050 \
+    -v "$state:/state" "$image" node collector.mjs >/dev/null
+  for _ in $(seq 1 90); do
+    if ! docker inspect "$WHATSAPP_CONTAINER" --format '{{.State.Running}}' 2>/dev/null | grep -qx true; then
+      docker logs --tail 80 "$WHATSAPP_CONTAINER" >&2 || true
+      echo "ERROR: WhatsApp collector exited" >&2
+      return 1
+    fi
+    if docker logs "$WHATSAPP_CONTAINER" 2>&1 | grep -E 'WHATSAPP_(QR_READY|CONNECTED)' >/dev/null; then
+      echo "WHATSAPP_START_OK image=$image"
+      return 0
+    fi
+    sleep 1
+  done
+  docker logs --tail 80 "$WHATSAPP_CONTAINER" >&2 || true
+  echo "ERROR: WhatsApp collector did not reach QR/connected state" >&2
+  return 1
+}
+
+whatsapp_stop() {
+  if container_exists "$WHATSAPP_CONTAINER"; then
+    docker stop "$WHATSAPP_CONTAINER" >/dev/null || true
+  fi
+  echo "WHATSAPP_STOP_OK"
+}
+
+whatsapp_status() {
+  local state="$TM_STATE_DIR/whatsapp"
+  if container_exists "$WHATSAPP_CONTAINER"; then
+    docker inspect "$WHATSAPP_CONTAINER" --format 'name={{.Name}} image={{.Config.Image}} status={{.State.Status}} started={{.State.StartedAt}}'
+    if ! container_exists "$WORKER_CONTAINER"; then
+      echo "shared_tor_namespace=worker_absent"
+    elif whatsapp_namespace_matches_worker; then
+      echo "shared_tor_namespace=ready"
+    else
+      echo "shared_tor_namespace=stale"
+    fi
+  else
+    echo "whatsapp=absent"
+  fi
+  if [[ -f "$state/health.json" && ! -L "$state/health.json" ]]; then
+    cat "$state/health.json"
+  fi
+  if container_exists "$WORKER_CONTAINER"     && docker inspect "$WORKER_CONTAINER" --format '{{.State.Running}}' 2>/dev/null | grep -qx true     && docker logs "$WORKER_CONTAINER" 2>&1 | grep -F 'TOR_TRANSPORT_READY' >/dev/null; then
+    echo "shared_tor_transport=ready"
+  else
+    echo "shared_tor_transport=pending_or_failed"
+  fi
+}
+
+whatsapp_qr_export() {
+  local state="$TM_STATE_DIR/whatsapp"
+  local source="$state/login-qr.png"
+  [[ -f "$source" && ! -L "$source" ]] || { echo "ERROR: WhatsApp QR is not ready" >&2; return 1; }
+  install -d -m 700 -o "$PROJECT_OPERATOR" -g "$PROJECT_OPERATOR" "$WHATSAPP_STAGE"
+  install -m 600 -o "$PROJECT_OPERATOR" -g "$PROJECT_OPERATOR" "$source" "$WHATSAPP_STAGE/login-qr.png"
+  echo "WHATSAPP_QR_READY path=$WHATSAPP_STAGE/login-qr.png"
+}
+
+worker_login_start() {
+  local image="${TM_WORKER_IMAGE:-}"
+  [[ -n "$image" ]] || { echo "ERROR: TM_WORKER_IMAGE is not configured" >&2; return 1; }
+  [[ -f "$WORKER_ROOT/worker.env" ]] || { echo "ERROR: run tmctl worker-import first" >&2; return 1; }
+  if container_exists "$WORKER_CONTAINER" && docker inspect "$WORKER_CONTAINER" --format '{{.State.Running}}' | grep -qx true; then
+    echo "ERROR: stop the production worker before QR login" >&2
+    return 1
+  fi
+  if container_exists "$WORKER_LOGIN_CONTAINER"; then
+    docker rm -f "$WORKER_LOGIN_CONTAINER" >/dev/null
+  fi
+  rm -f "$WORKER_ROOT/state/login-qr.png" "$WORKER_STAGE/login-qr.png"
+
+  docker run -d     --name "$WORKER_LOGIN_CONTAINER"     --read-only     --tmpfs /tmp:size=64m,mode=1777     --cap-drop ALL     --security-opt no-new-privileges:true     --init     --stop-timeout 10     --memory 256m     --cpus 0.25     --env-file "$WORKER_ROOT/worker.env"     -e TM_SERVER_WORKER=1     -e TM_TELEGRAM_PROXY_MODE=tor     -e TM_WORKER_STATE_DIR=/state     -e TM_TELEGRAM_SESSION=/state/telegram_helper.session     -e TM_LOGIN_QR_PATH=/state/login-qr.png     -e TM_INSTANCE_ID="${TM_INSTANCE_ID:-macbook-owner}"     -v "$WORKER_ROOT/state:/state"     "$image" python -u run_with_tor.py telegram_qr_login.py >/dev/null
+
+  for _ in $(seq 1 120); do
+    if [[ -f "$WORKER_ROOT/state/login-qr.png" ]]; then
+      install -m 600 -o "$PROJECT_OPERATOR" -g "$PROJECT_OPERATOR" "$WORKER_ROOT/state/login-qr.png" "$WORKER_STAGE/login-qr.png"
+      echo "WORKER_LOGIN_QR_READY path=$WORKER_STAGE/login-qr.png"
+      return 0
+    fi
+    if docker logs "$WORKER_LOGIN_CONTAINER" 2>&1 | grep -q 'SESSION_ALREADY_AUTHORIZED'; then
+      echo "WORKER_LOGIN_ALREADY_AUTHORIZED"
+      return 0
+    fi
+    if ! docker inspect "$WORKER_LOGIN_CONTAINER" --format '{{.State.Running}}' 2>/dev/null | grep -qx true; then
+      docker logs --tail 80 "$WORKER_LOGIN_CONTAINER" >&2 || true
+      if [[ -f "$WORKER_ROOT/state/tor-bootstrap.log" ]]; then
+        echo "--- persisted tor-bootstrap.log ---" >&2
+        tail -n 80 "$WORKER_ROOT/state/tor-bootstrap.log" >&2 || true
+      fi
+      echo "ERROR: QR login container exited before producing a QR code" >&2
+      return 1
+    fi
+    sleep 1
+  done
+  docker logs --tail 80 "$WORKER_LOGIN_CONTAINER" >&2 || true
+  if [[ -f "$WORKER_ROOT/state/tor-bootstrap.log" ]]; then
+    echo "--- persisted tor-bootstrap.log ---" >&2
+    tail -n 80 "$WORKER_ROOT/state/tor-bootstrap.log" >&2 || true
+  fi
+  echo "ERROR: QR code was not produced in time" >&2
+  return 1
+}
+
+worker_login_status() {
+  if ! container_exists "$WORKER_LOGIN_CONTAINER"; then
+    [[ -f "$WORKER_ROOT/state/telegram_helper.session" ]] && echo "worker_login=session_present" || echo "worker_login=absent"
+    return 0
+  fi
+  local running exit_code
+  running="$(docker inspect "$WORKER_LOGIN_CONTAINER" --format '{{.State.Running}}')"
+  exit_code="$(docker inspect "$WORKER_LOGIN_CONTAINER" --format '{{.State.ExitCode}}')"
+  if docker logs "$WORKER_LOGIN_CONTAINER" 2>&1 | grep -q 'QR_LOGIN_OK'; then
+    rm -f "$WORKER_STAGE/login-qr.png"
+    echo "worker_login=authorized running=$running exit_code=$exit_code"
+  elif docker logs "$WORKER_LOGIN_CONTAINER" 2>&1 | grep -q 'QR_2FA_REQUIRED'; then
+    echo "worker_login=two_factor_password_required running=$running exit_code=$exit_code"
+  elif [[ -f "$WORKER_ROOT/state/login-qr.png" ]]; then
+    install -m 600 -o "$PROJECT_OPERATOR" -g "$PROJECT_OPERATOR" "$WORKER_ROOT/state/login-qr.png" "$WORKER_STAGE/login-qr.png"
+    echo "worker_login=waiting_for_scan running=$running exit_code=$exit_code path=$WORKER_STAGE/login-qr.png"
+  else
+    echo "worker_login=starting running=$running exit_code=$exit_code"
+  fi
+}
+
+worker_login_stop() {
+  if container_exists "$WORKER_LOGIN_CONTAINER"; then
+    docker rm -f "$WORKER_LOGIN_CONTAINER" >/dev/null || true
+  fi
+  rm -f "$WORKER_ROOT/state/login-qr.png" "$WORKER_STAGE/login-qr.png"
+  echo "WORKER_LOGIN_STOP_OK"
+}
+
+google_credentials_import() {
+  local stage=/opt/telegram-manager/staging/google-sheets-service-account.json
+  local secret=/opt/telegram-manager/secrets/google-sheets-service-account.json
+  local target="$TM_STATE_DIR/google-sheets-service-account.json"
+  [[ -f "$stage" && ! -L "$stage" ]] || {
+    echo "ERROR: missing staged Google service-account JSON: $stage" >&2
+    return 1
+  }
+  [[ "$(stat -c '%a' "$stage")" == "600" ]] || {
+    echo "ERROR: staged Google credential must have mode 600" >&2
+    return 1
+  }
+  local email
+  email="$(python3 - "$stage" <<'PYGOOGLE'
+from pathlib import Path
+import json,sys
+path=Path(sys.argv[1])
+if path.stat().st_size<=0 or path.stat().st_size>20000:
+    raise SystemExit('ERROR: invalid Google credential size')
+try:
+    value=json.loads(path.read_text())
+except Exception:
+    raise SystemExit('ERROR: invalid Google credential JSON')
+if (value.get('type')!='service_account'
+        or value.get('token_uri')!='https://oauth2.googleapis.com/token'
+        or not str(value.get('client_email') or '').endswith('.gserviceaccount.com')
+        or not str(value.get('private_key') or '').startswith('-----BEGIN PRIVATE KEY-----')):
+    raise SystemExit('ERROR: invalid Google service-account credential')
+print(value['client_email'])
+PYGOOGLE
+)"
+  install -d -m 700 -o root -g root /opt/telegram-manager/secrets
+  install -m 600 -o root -g root "$stage" "$secret"
+  install -d -m 700 -o 10001 -g 10001 "$TM_STATE_DIR"
+  rm -rf -- "$target"
+  install -m 400 -o 10001 -g 10001 "$secret" "$target"
+  rm -f -- "$stage"
+
+  production_env
+  docker compose -p "$TM_PROJECT_NAME" -f "$TM_RELEASE_COMPOSE" restart api >/dev/null
+  local cid status running
+  cid="$(docker compose -p "$TM_PROJECT_NAME" -f "$TM_RELEASE_COMPOSE" ps -q api)"
+  for _ in $(seq 1 50); do
+    running="$(docker inspect --format '{{.State.Running}}' "$cid")"
+    status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}' "$cid")"
+    [[ "$running" == true ]] || { echo "ERROR: API stopped after Google credential import" >&2; return 1; }
+    if [[ "$status" == healthy ]]; then
+      docker exec -i "$cid" python -m tm_api.healthcheck >/dev/null
+      echo "GOOGLE_CREDENTIALS_IMPORT_OK client_email=$email"
+      return 0
+    fi
+    [[ "$status" != unhealthy ]] || { echo "ERROR: API unhealthy after Google credential import" >&2; return 1; }
+    sleep 1
+  done
+  echo "ERROR: API did not become healthy after Google credential import" >&2
+  return 1
+}
+
+backup_check() {
+  local dump=/opt/telegram-manager/backups/latest.dump
+  local bundle=/opt/telegram-manager/backups/latest.tar.gz
+  [[ -s "$dump" ]] || { echo "ERROR: missing $dump" >&2; return 1; }
+  [[ -s "$bundle" ]] || { echo "ERROR: missing $bundle" >&2; return 1; }
+  docker exec -i telegram-manager-db-1 pg_restore --list < "$dump" >/dev/null
+  stat -c 'latest_dump_size=%s latest_dump_mtime=%y' "$dump"
+  stat -c 'latest_bundle_size=%s latest_bundle_mtime=%y' "$bundle"
+  echo "BACKUP_CHECK_OK"
+}
+
+copy_secret_if_needed() {
+  local source="$1" destination="$2"
+  if [[ -e "$destination" ]]; then
+    cmp -s "$source" "$destination" || {
+      echo "ERROR: existing runtime credential differs: $destination" >&2
+      return 1
+    }
+    return 0
+  fi
+  install -m 600 -o root -g root "$source" "$destination"
+}
+
+replace_config_value() {
+  local key="$1" value="$2"
+  python3 - "$CONFIG" "$key" "$value" <<'PY'
+from pathlib import Path
+import os
+import sys
+path=Path(sys.argv[1])
+key=sys.argv[2]
+value=sys.argv[3]
+lines=path.read_text().splitlines()
+prefix=key+"="
+seen=False
+out=[]
+for line in lines:
+    if line.startswith(prefix):
+        out.append(prefix+value)
+        seen=True
+    else:
+        out.append(line)
+if not seen:
+    out.append(prefix+value)
+temp=path.with_suffix(".tmp")
+temp.write_text("\n".join(out)+"\n")
+os.chmod(temp,0o600)
+temp.replace(path)
+PY
+}
+
+finalize_v31_runtime() {
+  local source_repo=/opt/telegram-manager/git-v31
+  local release_dir=/opt/telegram-manager/releases/V31
+  local expected_head=c47753b9f5bb60b5c80626831e4899e36cb5b68d
+  local expected_tree=94e25f36f1651456d15b0be78817a747656e0f29
+  local merge_commit=0a13f19360c5852a797dcf00265cb272c7d9d853
+  local actual_head actual_tree tmp
+
+  actual_head="$(git -C "$source_repo" rev-parse HEAD)"
+  actual_tree="$(git -C "$source_repo" rev-parse HEAD^{tree})"
+  [[ "$actual_head" == "$expected_head" ]] || {
+    echo "ERROR: V31 source HEAD mismatch: $actual_head" >&2
+    return 1
+  }
+  [[ "$actual_tree" == "$expected_tree" ]] || {
+    echo "ERROR: V31 source tree mismatch: $actual_tree" >&2
+    return 1
+  }
+
+  install -d -m 700 /opt/telegram-manager/releases
+  if [[ ! -d "$release_dir" ]]; then
+    tmp="/opt/telegram-manager/releases/.V31.tmp.$$"
+    rm -rf "$tmp"
+    install -d -m 700 "$tmp"
+    git -C "$source_repo" archive HEAD | tar -x -C "$tmp"
+    {
+      echo "release=V31"
+      echo "source_commit=$actual_head"
+      echo "merge_commit=$merge_commit"
+      echo "tree=$actual_tree"
+      echo "api_image=$TM_API_IMAGE"
+      echo "api_image_id=$(docker image inspect "$TM_API_IMAGE" --format '{{.Id}}')"
+      echo "calendar_image=$TM_CALENDAR_IMAGE"
+      echo "calendar_image_id=$(docker image inspect "$TM_CALENDAR_IMAGE" --format '{{.Id}}')"
+      echo "created_at=$(date -Is)"
+    } > "$tmp/RELEASE"
+    chmod 600 "$tmp/RELEASE"
+    mv "$tmp" "$release_dir"
+  fi
+
+  install -d -m 700 /opt/telegram-manager/runtime
+  install -d -m 700 /opt/telegram-manager/runtime/credentials
+  copy_secret_if_needed "$TM_API_ENV_FILE" /opt/telegram-manager/runtime/credentials/api-base.env
+  copy_secret_if_needed "$TM_API_DSN_FILE" /opt/telegram-manager/runtime/credentials/api.env
+  copy_secret_if_needed "$TM_CALENDAR_ENV_FILE" /opt/telegram-manager/runtime/credentials/calendar.env
+
+  replace_config_value TM_RELEASE_REPO "$release_dir"
+  replace_config_value TM_RELEASE_COMPOSE "$release_dir/deploy/v31/compose.production.yaml"
+  replace_config_value TM_API_ENV_FILE /opt/telegram-manager/runtime/credentials/api-base.env
+  replace_config_value TM_API_DSN_FILE /opt/telegram-manager/runtime/credentials/api.env
+  replace_config_value TM_CALENDAR_ENV_FILE /opt/telegram-manager/runtime/credentials/calendar.env
+
+  cat > /etc/systemd/system/telegram-manager-backup.service <<'EOF'
+[Unit]
+Description=Telegram Manager recovery backup
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+UMask=0077
+ExecStart=/usr/local/sbin/tmctl-root backup
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+EOF
+
+  cat > /etc/systemd/system/telegram-manager-backup.timer <<'EOF'
+[Unit]
+Description=Daily Telegram Manager recovery backup
+
+[Timer]
+OnCalendar=*-*-* 03:20:00 UTC
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now telegram-manager-backup.timer
+
+  # Reload the neutralized runtime paths for the checks below.
+  # shellcheck disable=SC1090
+  source "$CONFIG"
+  cd "$TM_RELEASE_REPO"
+  python3 deploy/backup_database.py
+  backup_check
+  systemctl is-enabled telegram-manager-backup.timer
+  systemctl is-active telegram-manager-backup.timer
+  echo "V31_RUNTIME_FINALIZE_OK"
+}
+
+server_admin_sudo_cleanup() {
+  local managed=/etc/sudoers.d/server-admin-controller-telegram-manager-deploy
+  local self_path=/usr/local/sbin/tmctl-root
+  local self_sha legacy owner_group mode
+  local -a legacy_files=()
+
+  [[ -f "$managed" && ! -L "$managed" ]] || {
+    echo "ERROR: missing Server Admin Controller sudoers: $managed" >&2
+    return 1
+  }
+  owner_group="$(stat -c '%U:%G' "$managed")"
+  mode="$(stat -c '%a' "$managed")"
+  [[ "$owner_group" == "root:root" && "$mode" == "440" ]] || {
+    echo "ERROR: unsafe Server Admin Controller sudoers permissions" >&2
+    return 1
+  }
+  /usr/sbin/visudo -cf "$managed" >/dev/null
+  self_sha="$(sha256sum "$self_path" | awk '{print $1}')"
+  grep -Fxq "$PROJECT_OPERATOR ALL=(root) NOPASSWD: sha256:$self_sha $self_path" "$managed" || {
+    echo "ERROR: Server Admin Controller rule does not pin current tmctl-root digest" >&2
+    return 1
+  }
+
+  for legacy in /etc/sudoers.d/telegram-manager /etc/sudoers.d/chatgpt-tm; do
+    [[ -e "$legacy" ]] || continue
+    [[ -f "$legacy" && ! -L "$legacy" ]] || {
+      echo "ERROR: unsafe legacy sudoers path: $legacy" >&2
+      return 1
+    }
+    owner_group="$(stat -c '%U:%G' "$legacy")"
+    mode="$(stat -c '%a' "$legacy")"
+    [[ "$owner_group" == "root:root" && "$mode" == "440" ]] || {
+      echo "ERROR: unsafe legacy sudoers permissions: $legacy" >&2
+      return 1
+    }
+    python3 - "$legacy" <<'PYLEGACY'
+from pathlib import Path
+import re
+import sys
+
+path=Path(sys.argv[1])
+allowed_users={"telegram-manager","chatgpt-tm"}
+rule_count=0
+for raw in path.read_text().splitlines():
+    line=raw.strip()
+    if not line or line.startswith("#"):
+        continue
+    match=re.fullmatch(r"Defaults:([a-z0-9-]+) env_reset", line)
+    if match and match.group(1) in allowed_users:
+        continue
+    match=re.fullmatch(
+        r"([a-z0-9-]+) ALL=\(root\) NOPASSWD: /usr/local/sbin/tmctl-root",
+        line,
+    )
+    if match and match.group(1) in allowed_users:
+        rule_count += 1
+        continue
+    raise SystemExit(f"ERROR: unexpected legacy sudoers line in {path}: {line}")
+if rule_count != 1:
+    raise SystemExit(f"ERROR: expected exactly one tmctl-root rule in {path}")
+PYLEGACY
+    legacy_files+=("$legacy")
+  done
+
+  for legacy in "${legacy_files[@]}"; do
+    rm -f -- "$legacy"
+  done
+  /usr/sbin/visudo -cf /etc/sudoers >/dev/null
+  echo "SERVER_ADMIN_SUDO_CLEANUP_OK removed=${#legacy_files[@]}"
+}
+
+case "${1:-}" in
+  status)
+    docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}' |
+      grep -E 'telegram-manager|NAMES'
+    ;;
+
+  status-all)
+    docker ps -a --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}' |
+      grep -E 'telegram-manager|NAMES'
+    ;;
+
+  server-admin-sudo-cleanup)
+    server_admin_sudo_cleanup
+    ;;
+
+  post)
+    cd "$TM_RELEASE_REPO"
+    production_env
+    bash deploy/v31/post_deploy.sh "$TM_RELEASE_COMPOSE"
+    ;;
+
+  backup)
+    cd "$TM_RELEASE_REPO"
+    python3 deploy/backup_database.py
+    ;;
+
+  backup-check)
+    backup_check
+    ;;
+
+  google-credentials-import)
+    google_credentials_import
+    ;;
+
+  backup-timer)
+    systemctl is-enabled telegram-manager-backup.timer
+    systemctl is-active telegram-manager-backup.timer
+    systemctl list-timers --all telegram-manager-backup.timer --no-pager
+    systemctl cat telegram-manager-backup.service
+    ;;
+
+  v31-runtime-finalize)
+    finalize_v31_runtime
+    ;;
+
+  calendar-owner-provision)
+    production_env
+    TM_CALENDAR_IMAGE="$TM_CALENDAR_IMAGE" TM_INSTANCE_ID="${TM_INSTANCE_ID:-macbook-owner}" \
+      bash "$TM_RELEASE_REPO/deploy/ops/calendar_accounts.sh" owner "${2:-owner}"
+    TM_CALDAV_PUBLIC_HOST="${TM_CALDAV_PUBLIC_HOST:-service.example.invalid}" \
+      bash "$TM_RELEASE_REPO/deploy/ops/calendar_public.sh" "${TM_CALDAV_PUBLIC_HOST:-service.example.invalid}"
+    ;;
+
+  calendar-user-provision)
+    production_env
+    [[ -n "${2:-}" ]] || { echo "ERROR: usage: tmctl calendar-user-provision <username>" >&2; exit 2; }
+    TM_CALENDAR_IMAGE="$TM_CALENDAR_IMAGE" TM_INSTANCE_ID="${TM_INSTANCE_ID:-macbook-owner}" \
+      bash "$TM_RELEASE_REPO/deploy/ops/calendar_accounts.sh" user "$2"
+    TM_CALDAV_PUBLIC_HOST="${TM_CALDAV_PUBLIC_HOST:-service.example.invalid}" \
+      bash "$TM_RELEASE_REPO/deploy/ops/calendar_public.sh" "${TM_CALDAV_PUBLIC_HOST:-service.example.invalid}"
+    ;;
+
+  calendar-public-enable)
+    production_env
+    TM_CALDAV_PUBLIC_HOST="${TM_CALDAV_PUBLIC_HOST:-service.example.invalid}" \
+      bash "$TM_RELEASE_REPO/deploy/ops/calendar_public.sh" "${TM_CALDAV_PUBLIC_HOST:-service.example.invalid}"
+    ;;
+
+  calendar-owner-password-set)
+    production_env
+    TM_CALENDAR_IMAGE="$TM_CALENDAR_IMAGE" TM_INSTANCE_ID="${TM_INSTANCE_ID:-macbook-owner}" \
+      bash "$TM_RELEASE_REPO/deploy/ops/calendar_owner_password.sh"
+    ;;
+
+  storage-migration-preview)
+    production_env
+    container="${TM_PROJECT_NAME}-api-1"
+    container_exists "$container" || { echo "ERROR: production API container not found" >&2; exit 1; }
+    docker exec -i "$container" python -m tm_api.storage_migration_cli preview
+    ;;
+
+  storage-migration-apply)
+    production_env
+    container="${TM_PROJECT_NAME}-api-1"
+    container_exists "$container" || { echo "ERROR: production API container not found" >&2; exit 1; }
+    docker exec -i "$container" python -m tm_api.storage_migration_cli apply
+    ;;
+
+  reminder-normalization-preview)
+    production_env
+    container="${TM_PROJECT_NAME}-api-1"
+    container_exists "$container" || { echo "ERROR: production API container not found" >&2; exit 1; }
+    docker exec -i "$container" python -m tm_api.reminder_normalization_cli preview
+    ;;
+
+  reminder-normalization-apply)
+    production_env
+    container="${TM_PROJECT_NAME}-api-1"
+    container_exists "$container" || { echo "ERROR: production API container not found" >&2; exit 1; }
+    docker exec -i "$container" python -m tm_api.reminder_normalization_cli apply
+    ;;
+
+  worker-login-start)
+    worker_login_start
+    ;;
+
+  worker-login-status)
+    worker_login_status
+    ;;
+
+  worker-login-stop)
+    worker_login_stop
+    ;;
+
+  worker-import)
+    worker_import
+    ;;
+
+  vision-credentials-import)
+    vision_credentials_import
+    ;;
+
+  worker-start)
+    worker_start_image "${TM_WORKER_IMAGE:-}"
+    ;;
+
+  worker-enable)
+    worker_start_image "${TM_WORKER_IMAGE:-}"
+    replace_config_value TM_WORKER_ENABLED true
+    echo "WORKER_ENABLED"
+    ;;
+
+  worker-stop)
+    worker_stop
+    ;;
+
+  worker-disable)
+    worker_stop
+    replace_config_value TM_WORKER_ENABLED false
+    echo "WORKER_DISABLED"
+    ;;
+
+  worker-status)
+    if container_exists "$WORKER_CONTAINER"; then
+      docker inspect "$WORKER_CONTAINER" --format 'name={{.Name}} image={{.Config.Image}} status={{.State.Status}} started={{.State.StartedAt}}'
+      docker logs --tail 20 "$WORKER_CONTAINER" 2>&1
+    else
+      echo "worker=absent"
+    fi
+    ;;
+
+  whatsapp-start)
+    whatsapp_start_image
+    replace_config_value TM_WHATSAPP_ENABLED true
+    ;;
+
+  whatsapp-stop)
+    whatsapp_stop
+    ;;
+
+  whatsapp-disable)
+    whatsapp_stop
+    replace_config_value TM_WHATSAPP_ENABLED false
+    echo "WHATSAPP_DISABLED"
+    ;;
+
+  whatsapp-status)
+    whatsapp_status
+    ;;
+
+  whatsapp-qr-export)
+    whatsapp_qr_export
+    ;;
+
+  deploy)
+    release="${2:-}"
+    if [[ ! "$release" =~ ^V[0-9]+$ ]]; then
+      echo "ERROR: usage: tmctl deploy V34" >&2
+      exit 2
+    fi
+    with_deploy_lock bash "$TM_RELEASE_REPO/deploy/ops/deploy_release.sh" "$release"
+    ;;
+
+  rollback-last)
+    with_deploy_lock bash "$TM_RELEASE_REPO/deploy/ops/rollback_last.sh"
+    ;;
+
+
+  legacy-v19-preview)
+    if container_exists telegram-manager-v19-test; then
+      docker inspect telegram-manager-v19-test --format \
+        'name={{.Name}} image={{.Config.Image}} status={{.State.Status}} created={{.Created}} mounts={{range .Mounts}}{{.Type}}:{{.Name}}:{{.Destination}};{{end}} networks={{range $k,$v := .NetworkSettings.Networks}}{{$k}};{{end}}'
+    else
+      echo "legacy_v19=absent"
+    fi
+    ;;
+
+  legacy-v19-stop)
+    if container_exists telegram-manager-v19-test; then
+      docker stop telegram-manager-v19-test
+    fi
+    ;;
+
+  legacy-v19-remove)
+    if container_exists telegram-manager-v19-test; then
+      docker rm telegram-manager-v19-test
+    fi
+    ;;
+
+  stale-preview)
+    for name in ${TM_STALE_CONTAINERS:-}; do
+      if container_exists "$name"; then
+        docker inspect "$name" --format \
+          'name={{.Name}} image={{.Config.Image}} status={{.State.Status}} created={{.Created}} mounts={{range .Mounts}}{{.Type}}:{{.Name}}:{{.Destination}};{{end}} networks={{range $k,$v := .NetworkSettings.Networks}}{{$k}};{{end}}'
+      fi
+    done
+    ;;
+
+  stale-stop)
+    for name in ${TM_STALE_CONTAINERS:-}; do
+      if container_exists "$name"; then
+        docker stop "$name"
+      fi
+    done
+    ;;
+
+  stale-remove)
+    for name in ${TM_STALE_CONTAINERS:-}; do
+      if container_exists "$name"; then
+        docker rm "$name"
+      fi
+    done
+    ;;
+
+  historical-cleanup-preview)
+    with_deploy_lock historical_cleanup_preview
+    ;;
+
+  historical-cleanup-apply)
+    digest="${2:-}"
+    with_deploy_lock historical_cleanup_apply "$digest"
+    ;;
+
+  *)
+    cat >&2 <<'USAGE'
+Allowed commands:
+  tmctl status
+  tmctl status-all
+  tmctl server-admin-sudo-cleanup
+  tmctl post
+  tmctl backup
+  tmctl backup-check
+  tmctl google-credentials-import # staged JSON at /opt/telegram-manager/staging/google-sheets-service-account.json
+  tmctl backup-timer
+  tmctl v31-runtime-finalize
+  tmctl calendar-owner-provision [username]
+  tmctl calendar-user-provision <username>
+  tmctl calendar-public-enable
+  tmctl calendar-owner-password-set  # password on stdin; never printed
+  tmctl storage-migration-preview     # JSON request on stdin
+  tmctl storage-migration-apply       # exact preview JSON on stdin
+  tmctl reminder-normalization-preview # JSON request on stdin
+  tmctl reminder-normalization-apply   # exact preview JSON on stdin
+  tmctl worker-login-start
+  tmctl worker-login-status
+  tmctl worker-login-stop
+  tmctl worker-import
+  tmctl vision-credentials-import # staged /opt/telegram-manager/staging/vision.env
+  tmctl worker-start
+  tmctl worker-enable
+  tmctl worker-stop
+  tmctl worker-disable
+  tmctl worker-status
+  tmctl whatsapp-start
+  tmctl whatsapp-stop
+  tmctl whatsapp-disable
+  tmctl whatsapp-status
+  tmctl whatsapp-qr-export
+  tmctl deploy V34
+  tmctl rollback-last
+  tmctl legacy-v19-preview
+  tmctl legacy-v19-stop
+  tmctl legacy-v19-remove
+  tmctl stale-preview
+  tmctl stale-stop
+  tmctl stale-remove
+  tmctl historical-cleanup-preview
+  tmctl historical-cleanup-apply <digest>
+USAGE
+    exit 2
+    ;;
+esac

@@ -1,0 +1,29 @@
+FROM python:3.12-slim-bookworm
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    TM_SERVER_WORKER=1 \
+    TM_WORKER_STATE_DIR=/state \
+    TM_TELEGRAM_SESSION=/state/telegram_helper.session \
+    TM_MODELS_HOME=/models-root \
+    TM_MODELS_DIR=/models \
+    TM_AUDIO_PYTHON=/usr/local/bin/python \
+    TM_MEDIA_BACKEND=linux \
+    TM_OCR_LANG=rus+eng
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      tesseract-ocr tesseract-ocr-rus tesseract-ocr-eng libgomp1 ca-certificates tor \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY requirements.worker.txt ./
+RUN python -m pip install --no-cache-dir -r requirements.worker.txt \
+ && python -m pip check
+
+COPY worker ./worker
+RUN useradd --uid 10001 --create-home --shell /usr/sbin/nologin tmworker
+
+WORKDIR /app/worker
+USER 10001
+CMD ["python", "-u", "run_with_tor.py", "telegram_supabase.py"]
