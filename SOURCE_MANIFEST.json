@@ -1,9 +1,9 @@
 {
   "schema": 1,
-  "source_sha": "ed6f0b472563d1d6277c934452ef8ca7c9ac305f",
-  "sanitized_content_sha256": "974d77096b0bfe80987b720db9c39865df01ec343534c7788c78e4ca21e2951d",
+  "transformer_version": 2,
+  "source_sha": "bb71d8268b6b3e82067fac9807f23c02e9c314b2",
+  "sanitized_content_sha256": "c01f2e1c60ce3ce61733f1436356772ceefd2a4fd428579d9e662fabd907e76d",
   "policy_sha256": "0a73e445ee98029526be8c2e6c3a2de68097de42fe5a93fd972673f7797badcc",
   "files": 301,
-  "production_artifact": false,
-  "transformer_version": 2
+  "production_artifact": false
 }

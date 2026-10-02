@@ -82,9 +82,9 @@ def reminder_decision(asset, item, parent_title, workstream):
         if not isinstance(action, str) or not action.strip():
             return {"mode": "preserve", "state": "active_without_next_action"}
         description = (
-            "Конкретное действие по монтажу из canonical Postproduction state."
+            "Есть конкретное действие по монтажу."
             if workstream == "edit"
-            else "Конкретное действие по цвету из canonical Postproduction state."
+            else "Цвет ещё не готов."
         )
         return {
             "mode": "open",
