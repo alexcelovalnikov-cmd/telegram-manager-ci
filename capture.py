@@ -58,8 +58,8 @@ def main():
                       'ENV TM_SERVER_WORKER=1 TM_WORKER_STATE_DIR=/state TM_TELEGRAM_SESSION=/state/telegram_helper.session TM_MODELS_HOME=/models-root TM_MODELS_DIR=/models TM_AUDIO_PYTHON=/usr/local/bin/python TM_MEDIA_BACKEND=linux TM_OCR_LANG=rus+eng']
         reqs = {'api': ['requirements.lock', 'requirements.v24.txt'], 'calendar': ['requirements.calendar.txt'], 'worker': ['requirements.worker.txt']}[component]
         lines += ['COPY ' + ' '.join(reqs) + ' /dependency-inputs/',
-                  'RUN mkdir /dependency-wheels && python -m pip download --only-binary=:all: --dest /dependency-wheels ' + ' '.join('-r /dependency-inputs/' + p for p in reqs),
-                  'RUN python -m pip install --no-index --find-links=/dependency-wheels ' + ' '.join('-r /dependency-inputs/' + p for p in reqs) + ' && python -m pip check']
+                  'RUN mkdir /dependency-wheels && python -m pip download --only-binary=:all: --no-binary=pyaes --dest /dependency-wheels setuptools==80.9.0 wheel==0.45.1 ' + ' '.join('-r /dependency-inputs/' + p for p in reqs),
+                  'RUN python -m pip install --no-index --find-links=/dependency-wheels setuptools==80.9.0 wheel==0.45.1 && python -m pip install --no-index --no-build-isolation --find-links=/dependency-wheels ' + ' '.join('-r /dependency-inputs/' + p for p in reqs) + ' && python -m pip check']
     lines += ['USER 10001:10001', 'ENTRYPOINT []', 'CMD ["/bin/false"]']
     recipe = '\n'.join(lines) + '\n'
     (root / 'Dependency.Dockerfile').write_text(recipe)

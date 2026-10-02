@@ -23,7 +23,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends skopeo
           skopeo --version > evidence/skopeo-version.txt
-          skopeo copy docker-archive:evidence/candidate-image.tar oci:evidence/oci:candidate
+          skopeo copy --format v2s2 docker-archive:evidence/candidate-image.tar oci:evidence/oci:candidate
           docker pull aquasec/trivy:0.69.3
           scanner=$(docker image inspect aquasec/trivy:0.69.3 --format '{{index .RepoDigests 0}}')
           docker image inspect "$scanner" > evidence/scanner-inspect.json
@@ -31,9 +31,10 @@ jobs:
           docker run --rm --cpus 2 --memory 2g -v "$PWD/evidence:/evidence" "$scanner" image --timeout 10m --input /evidence/candidate-image.tar --format spdx-json --output /evidence/sbom.spdx.json
           python3 - <<'PYMETA'
           import pathlib,json,hashlib
-          root=pathlib.Path('evidence'); index=json.loads((root/'oci/index.json').read_text()); ref=index['manifests'][0]['digest']; manifest=json.loads((root/'oci/blobs/sha256'/ref.split(':')[1]).read_text()); candidate=json.loads((root/'candidate.json').read_text()); assert manifest['config']['digest']==candidate['candidate_image_id']; candidate['candidate_oci_manifest_digest']=ref; candidate['oci_manifest']=manifest; candidate['evidence_files_sha256']={str(p.relative_to(root)):hashlib.file_digest(p.open('rb'),'sha256').hexdigest() for p in root.rglob('*') if p.is_file() and p.name!='candidate.json'}; (root/'candidate.json').write_text(json.dumps(candidate,indent=2)+'\n')
+          root=pathlib.Path('evidence'); index=json.loads((root/'oci/index.json').read_text()); ref=index['manifests'][0]['digest']; manifest=json.loads((root/'oci/blobs/sha256'/ref.split(':')[1]).read_text()); candidate=json.loads((root/'candidate.json').read_text()); assert manifest['config']['digest']==candidate['candidate_image_id'], (manifest['config']['digest'],candidate['candidate_image_id']); candidate['candidate_oci_manifest_digest']=ref; candidate['oci_manifest']=manifest; candidate['evidence_files_sha256']={str(p.relative_to(root)):hashlib.file_digest(p.open('rb'),'sha256').hexdigest() for p in root.rglob('*') if p.is_file() and p.name!='candidate.json'}; (root/'candidate.json').write_text(json.dumps(candidate,indent=2)+'\n')
           PYMETA
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: dependency-${{ matrix.component }}-${{ github.sha }}
           path: evidence/
